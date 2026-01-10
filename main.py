@@ -52,7 +52,7 @@ def extract_json(text: str) -> str:
 
 def get_sheet():
     """
-    Connect to Google Sheets using service account file.
+    Connect to Google Sheets using service account key file.
     """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -60,14 +60,26 @@ def get_sheet():
     ]
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     gc = gspread.authorize(creds)
+
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    ws = sh.worksheet(GOOGLE_WORKSHEET_NAME)
+
+    # Use the configured worksheet name if it exists, otherwise fallback to first tab
+    try:
+        ws = sh.worksheet(GOOGLE_WORKSHEET_NAME)
+    except Exception:
+        ws = sh.get_worksheet(0)
+
     return ws
 
 
 @app.get("/")
 def home():
     return {"status": "ok", "message": "server running"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.post("/upload")
@@ -162,6 +174,9 @@ INVOICE TEXT:
 
         ws.append_row(row, value_input_option="USER_ENTERED")
 
+        # row number after append (simple way)
+        sheet_row = len(ws.get_all_values())
+
     except Exception as e:
         return {
             "filename": file.filename,
@@ -177,6 +192,7 @@ INVOICE TEXT:
         "chars": len(text),
         "extracted": data,
         "sheet_status": "row_appended",
+        "sheet_row": sheet_row,
         "service_account_file_used": SERVICE_ACCOUNT_FILE,
         "worksheet_used": GOOGLE_WORKSHEET_NAME
     }
