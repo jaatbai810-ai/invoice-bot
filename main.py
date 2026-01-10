@@ -8,35 +8,58 @@ import pdfplumber
 from dotenv import load_dotenv
 from openai import OpenAI
 
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Load .env locally (on Render env vars are loaded automatically too)
 load_dotenv()
+
+# --- OpenAI ---
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# --- Google Sheets settings ---
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1")
+
+# IMPORTANT: on Render, your secret file becomes /etc/secrets/service_account.json
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
 
 app = FastAPI()
 
 def clean_text(t: str) -> str:
-    # Fix some weird repeated letters caused by certain PDF fonts
+    # Fix weird repeated letters caused by some PDF fonts
     t = re.sub(r'([A-Za-z])\1{2,}', r'\1', t)  # "CCCOmpany" -> "Company"
     t = re.sub(r'\s+', ' ', t)                 # collapse whitespace
     return t.strip()
 
 def extract_json(text: str) -> str:
     """
-    Removes ```json fences if present and tries to keep only the JSON object.
+    Remove ```json fences if model outputs them.
+    Keep only JSON object if extra text exists.
     """
     text = text.strip()
-
-    # Remove starting fence like ```json or ```
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    # Remove ending fence ```
     text = re.sub(r"\s*```$", "", text)
 
-    # Keep only the JSON object part if extra text exists
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         return text[start:end+1]
-
     return text
+
+def get_sheet():
+    """
+    Connect to Google Sheets using service account JSON key file.
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(WORKSHEET_NAME)
+    return ws
 
 @app.get("/")
 def home():
@@ -44,6 +67,11 @@ def home():
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    # Basic validation
+    if file.content_type not in ["application/pdf", "application/octet-stream"]:
+        return {"error": f"Please upload a PDF. Got content_type={file.content_type}"}
+
+    # Read uploaded PDF into memory
     pdf_bytes = await file.read()
 
     # 1) Extract text from PDF
@@ -61,7 +89,7 @@ async def upload(file: UploadFile = File(...)):
 
     text = clean_text(text)
 
-    # 2) Ask OpenAI to return strict JSON
+    # 2) Ask OpenAI for structured JSON
     schema_hint = {
         "vendor_name": "",
         "invoice_number": "",
@@ -71,9 +99,7 @@ async def upload(file: UploadFile = File(...)):
         "subtotal": "",
         "tax": "",
         "total": "",
-        "line_items": [
-            {"description": "", "quantity": "", "unit_price": "", "amount": ""}
-        ]
+        "line_items": []
     }
 
     prompt = f"""
@@ -97,25 +123,50 @@ INVOICE TEXT:
     )
 
     output_text = resp.output_text.strip()
-
-    # 3) Remove ```json fences if the model still adds them
     json_str = extract_json(output_text)
 
-    # 4) Parse JSON safely
     try:
         data = json.loads(json_str)
     except Exception:
         return {
             "filename": file.filename,
-            "chars": len(text),
             "preview": text[:700],
             "raw_model_output": output_text[:2000],
-            "cleaned_json_attempt": json_str[:2000],
             "error": "Model did not return valid JSON"
+        }
+
+    # 3) Validate env vars before writing
+    if not SHEET_ID:
+        return {"error": "Missing GOOGLE_SHEET_ID (set it in Render env vars or .env)"}
+
+    # 4) Write to Google Sheets
+    try:
+        ws = get_sheet()
+
+        row = [
+            data.get("vendor_name", ""),
+            data.get("invoice_number", ""),
+            data.get("invoice_date", ""),
+            data.get("due_date", ""),
+            data.get("currency", ""),
+            data.get("subtotal", ""),
+            data.get("tax", ""),
+            data.get("total", ""),
+        ]
+
+        ws.append_row(row, value_input_option="USER_ENTERED")
+
+    except Exception as e:
+        return {
+            "filename": file.filename,
+            "extracted": data,
+            "service_account_file_used": SERVICE_ACCOUNT_FILE,
+            "error": f"Google Sheets write failed: {str(e)}"
         }
 
     return {
         "filename": file.filename,
-        "chars": len(text),
-        "extracted": data
+        "extracted": data,
+        "sheet_status": "row_appended",
+        "service_account_file_used": SERVICE_ACCOUNT_FILE
     }
