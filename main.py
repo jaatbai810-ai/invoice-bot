@@ -1,12 +1,14 @@
+# main.py
 import os
-import re
 import json
+import re
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import pdfplumber
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+
+import pdfplumber
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -14,128 +16,213 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
 
-# =========================
-# ENV / CONFIG
-# =========================
+app = FastAPI(title="Invoice Bot", version="1.0.0")
+
+
+# ---------------------------
+# Config
+# ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 SHEET_ID = os.getenv("SHEET_ID", "")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "invoices")
 
-# Render secret file path: /etc/secrets/service_account.json
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_account.json")
-if not os.path.exists(SERVICE_ACCOUNT_FILE) and os.path.exists("service_account.json"):
-    SERVICE_ACCOUNT_FILE = "service_account.json"
+# Render secret file location (you said this exists)
+SERVICE_ACCOUNT_PATH = os.getenv(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "/etc/secrets/service_account.json"
+)
+
+# Your sheet headers (row 1) — we will write in exactly this order
+SHEET_COLUMNS = [
+    "invoice_number",
+    "invoice_data",     # mapped from invoice_date
+    "vendor_name",
+    "invoice_amount",   # mapped from total
+    "due_date",
+    "currency",
+    "subtotal",
+    "tax",
+    "total",
+]
 
 
-# =========================
-# APP
-# =========================
-app = FastAPI()
+# ---------------------------
+# Helpers
+# ---------------------------
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract text from PDF bytes using pdfplumber."""
+    text_parts = []
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                text_parts.append(page_text)
+    return "\n\n".join(text_parts).strip()
 
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "server running"}
-
-
-@app.get("/debug-env")
-def debug_env():
-    """Quick debug to confirm Render env vars are actually loaded."""
-    sheet_id = os.getenv("SHEET_ID") or ""
-    sa_path = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_account.json")
-    return {
-        "SHEET_ID_present": bool(sheet_id),
-        "SHEET_ID_value_preview": sheet_id[:6],
-        "WORKSHEET_NAME": os.getenv("WORKSHEET_NAME"),
-        "SERVICE_ACCOUNT_FILE": sa_path,
-        "service_account_file_exists": os.path.exists(sa_path),
-    }
-
-
-# =========================
-# HELPERS
-# =========================
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    parts: List[str] = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            t = (p.extract_text() or "").strip()
-            if t:
-                parts.append(t)
-    return "\n\n".join(parts).strip()
-
-
-def clean_to_json_object(raw: str) -> str:
-    raw = (raw or "").strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```$", "", raw)
-    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    return m.group(0).strip() if m else raw
-
-
-def safe_float(x: Any) -> Optional[float]:
-    if x is None:
+def safe_float(val: Any) -> Optional[float]:
+    """Convert values like '1,245.00', '$124.50', 'AUD 99' to float."""
+    if val is None:
         return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip()
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
     if not s:
         return None
-    s = re.sub(r"[^\d.\-]", "", s)
+    # remove currency symbols/letters and keep digits, dot, comma, minus
+    s = re.sub(r"[^0-9\.,\-]", "", s)
+    # handle thousands commas
+    if s.count(",") > 0 and s.count(".") <= 1:
+        s = s.replace(",", "")
     try:
         return float(s)
-    except:
+    except Exception:
         return None
 
 
-def normalize_extracted(d: Dict[str, Any]) -> Dict[str, Any]:
-    vendor_name = (d.get("vendor_name") or "").strip()
-    invoice_number = (d.get("invoice_number") or "").strip()
-    invoice_date = (d.get("invoice_date") or "").strip()
-    due_date = (d.get("due_date") or "").strip()
-    currency = (d.get("currency") or "").strip().upper()
+def normalize_extracted(obj: Any) -> Dict[str, Any]:
+    """
+    Make sure keys exist and types are reasonable.
+    Expected keys:
+    vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, line_items(optional)
+    """
+    if not isinstance(obj, dict):
+        obj = {}
 
-    subtotal = safe_float(d.get("subtotal"))
-    tax = safe_float(d.get("tax"))
-    total = safe_float(d.get("total"))
+    def gs(key: str) -> str:
+        v = obj.get(key)
+        if v is None:
+            return ""
+        return str(v).strip()
 
-    if total is None and subtotal is not None and tax is not None:
-        total = subtotal + tax
-
-    def out_num(v: Optional[float]) -> str:
-        return "" if v is None else str(v)
-
-    line_items = d.get("line_items") or []
-    if not isinstance(line_items, list):
-        line_items = []
-
-    return {
-        "vendor_name": vendor_name,
-        "invoice_number": invoice_number,
-        "invoice_date": invoice_date,
-        "due_date": due_date,
-        "currency": currency,
-        "subtotal": out_num(subtotal),
-        "tax": out_num(tax),
-        "total": out_num(total),
-        "line_items": line_items,
+    normalized = {
+        "vendor_name": gs("vendor_name"),
+        "invoice_number": gs("invoice_number"),
+        "invoice_date": gs("invoice_date"),
+        "due_date": gs("due_date"),
+        "currency": gs("currency") or "AUD",
+        "subtotal": safe_float(obj.get("subtotal")) or 0.0,
+        "tax": safe_float(obj.get("tax")) or 0.0,
+        "total": safe_float(obj.get("total")) or 0.0,
     }
 
+    # Keep line_items if present (not used for sheet but useful in response)
+    li = obj.get("line_items")
+    if isinstance(li, list):
+        normalized["line_items"] = li
+    else:
+        normalized["line_items"] = []
 
-def openai_extract(text: str) -> Dict[str, Any]:
+    return normalized
+
+
+def looks_like_template_pdf(
+    filename: str,
+    extracted: Dict[str, Any],
+    text: str
+) -> bool:
+    """
+    Safety gate: block obvious placeholder/template PDFs so they don't pollute the sheet.
+    """
+    fname = (filename or "").lower()
+    inv_no = (extracted.get("invoice_number") or "").strip().lower()
+    vendor = (extracted.get("vendor_name") or "").strip().lower()
+    preview_text = (text or "").lower()
+
+    bad_tokens = [
+        "[", "]",
+        "enter date",
+        "payment due date",
+        "invoicesimple",
+        "template",
+        "placeholder",
+    ]
+
+    return (
+        "invoicesimple-pdf-template" in fname
+        or "template" in fname
+        or any(tok in preview_text for tok in bad_tokens)
+        or ("[" in inv_no or "]" in inv_no)
+        or ("[" in vendor or "]" in vendor)
+        or inv_no in ["", "0", "0000", "na", "n/a"]
+        or vendor in ["", "na", "n/a"]
+    )
+
+
+def get_gspread_client() -> gspread.Client:
+    if not os.path.exists(SERVICE_ACCOUNT_PATH):
+        raise RuntimeError(f"service_account.json not found at {SERVICE_ACCOUNT_PATH}")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def append_to_sheet(extracted: Dict[str, Any]) -> str:
+    """
+    Append one row to Google Sheets.
+    Uses your mapping:
+      invoice_data <- invoice_date
+      invoice_amount <- total
+    """
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID missing (Render env var not set).")
+
+    gc = get_gspread_client()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet(WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.sheet1  # fallback
+
+    row_payload = {
+        "invoice_number": extracted.get("invoice_number", ""),
+        "invoice_data": extracted.get("invoice_date", ""),     # mapping
+        "vendor_name": extracted.get("vendor_name", ""),
+        "invoice_amount": extracted.get("total", 0.0),         # mapping
+        "due_date": extracted.get("due_date", ""),
+        "currency": extracted.get("currency", ""),
+        "subtotal": extracted.get("subtotal", 0.0),
+        "tax": extracted.get("tax", 0.0),
+        "total": extracted.get("total", 0.0),
+    }
+
+    row = [row_payload.get(col, "") for col in SHEET_COLUMNS]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return "row_appended"
+
+
+def extract_with_openai(text: str) -> Dict[str, Any]:
+    """
+    Use OpenAI to extract invoice fields as JSON.
+    """
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY missing")
+        raise RuntimeError("OPENAI_API_KEY missing (Render env var not set).")
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     system = (
-        "Extract invoice fields from text. Return ONLY a valid JSON object with keys:\n"
-        "vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, line_items.\n"
-        "line_items is an array of objects: description, quantity, unit_price, amount.\n"
-        "If unknown, use empty string or empty array."
+        "You extract structured invoice data from text. "
+        "Return ONLY valid JSON (no markdown). "
+        "If a field is missing, return an empty string for text fields and 0 for numbers.\n\n"
+        "Required keys:\n"
+        "vendor_name (string)\n"
+        "invoice_number (string)\n"
+        "invoice_date (string, YYYY-MM-DD if possible)\n"
+        "due_date (string, YYYY-MM-DD if possible)\n"
+        "currency (string like AUD/USD)\n"
+        "subtotal (number)\n"
+        "tax (number)\n"
+        "total (number)\n"
+        "line_items (array of {description, quantity, unit_price, amount})\n"
     )
+
+    user = f"Invoice text:\n\n{text}"
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -143,95 +230,81 @@ def openai_extract(text: str) -> Dict[str, Any]:
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": f"INVOICE TEXT:\n{text}"},
+            {"role": "user", "content": user},
         ],
     )
 
     content = resp.choices[0].message.content or "{}"
-    content = clean_to_json_object(content)
-    return json.loads(content)
+    try:
+        data = json.loads(content)
+    except Exception:
+        # In case model returns something weird, try to salvage JSON
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        data = json.loads(m.group(0)) if m else {}
+    return data
 
 
-def get_gspread_client() -> gspread.Client:
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        raise RuntimeError(f"Service account file not found: {SERVICE_ACCOUNT_FILE}")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-    return gspread.authorize(creds)
+# ---------------------------
+# Routes
+# ---------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "server running"}
 
 
-def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Writes to sheet by matching your header names (Row 1) EXACTLY.
-    Your headers:
-    invoice_number, invoice_data, vendor_name, invoice_amount, due_date, currency, subtotal, tax, total
-    """
-    if not SHEET_ID:
-        raise RuntimeError("SHEET_ID missing")
-
-    gc = get_gspread_client()
-    sh = gc.open_by_key(SHEET_ID)
-    ws = sh.worksheet(WORKSHEET_NAME)
-
-    headers = ws.row_values(1)
-    norm_headers = [h.strip().lower() for h in headers]
-
-    row_map = {
-        "invoice_number": extracted.get("invoice_number", ""),
-        "invoice_data": extracted.get("invoice_date", ""),   # your sheet uses invoice_data
-        "vendor_name": extracted.get("vendor_name", ""),
-        "invoice_amount": extracted.get("total", ""),        # your sheet uses invoice_amount
-        "due_date": extracted.get("due_date", ""),
-        "currency": extracted.get("currency", ""),
-        "subtotal": extracted.get("subtotal", ""),
-        "tax": extracted.get("tax", ""),
-        "total": extracted.get("total", ""),
-    }
-
-    row = [row_map.get(h, "") for h in norm_headers]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-    # last row number (simple approach)
-    last_row = len(ws.get_all_values())
-    return {
-        "sheet_status": "row_appended",
-        "sheet_row": last_row,
-        "worksheet_used": WORKSHEET_NAME,
-        "service_account_file_used": os.path.basename(SERVICE_ACCOUNT_FILE),
-    }
-
-
-# =========================
-# ROUTE
-# =========================
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    """
+    Zapier sends form-data:
+      key: file
+      value: Gmail attachment
+    """
     try:
-        pdf_bytes = await file.read()
-        text = extract_text_from_pdf(pdf_bytes)
+        file_bytes = await file.read()
+        text = extract_pdf_text(file_bytes)
 
-        # If empty text, OCR is the next upgrade. For now still try with what we have.
-        model_out = openai_extract(text if text else "")
+        if not text:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "filename": file.filename,
+                    "chars": 0,
+                    "extracted": {},
+                    "sheet_status": "skipped_no_text",
+                    "reason": "No extractable text found (might be a scanned PDF). Add OCR later.",
+                },
+            )
+
+        model_out = extract_with_openai(text)
         extracted = normalize_extracted(model_out)
 
-        sheet_info = append_row_by_headers(extracted)
+        # --- Safety: skip templates/placeholders ---
+        if looks_like_template_pdf(file.filename or "", extracted, text):
+            return {
+                "filename": file.filename,
+                "chars": len(text),
+                "extracted": extracted,
+                "sheet_status": "skipped_template",
+                "reason": "Looks like a blank/template invoice (placeholders detected).",
+            }
+
+        # Append to sheet
+        sheet_status = append_to_sheet(extracted)
 
         return {
             "filename": file.filename,
             "chars": len(text),
             "extracted": extracted,
-            **sheet_info,
+            "sheet_status": sheet_status,
         }
 
     except Exception as e:
+        # Keep errors readable for Zapier debugging
         return JSONResponse(
             status_code=200,
             content={
                 "filename": getattr(file, "filename", ""),
-                "error": str(e),
+                "error": True,
+                "message": str(e),
             },
         )
