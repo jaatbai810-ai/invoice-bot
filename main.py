@@ -40,27 +40,37 @@ def home():
     return {"status": "ok", "message": "server running"}
 
 
+@app.get("/debug-env")
+def debug_env():
+    """Quick debug to confirm Render env vars are actually loaded."""
+    sheet_id = os.getenv("SHEET_ID") or ""
+    sa_path = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_account.json")
+    return {
+        "SHEET_ID_present": bool(sheet_id),
+        "SHEET_ID_value_preview": sheet_id[:6],
+        "WORKSHEET_NAME": os.getenv("WORKSHEET_NAME"),
+        "SERVICE_ACCOUNT_FILE": sa_path,
+        "service_account_file_exists": os.path.exists(sa_path),
+    }
+
+
 # =========================
 # HELPERS
 # =========================
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from PDF using pdfplumber."""
     parts: List[str] = []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for p in pdf.pages:
-            t = p.extract_text() or ""
-            t = t.strip()
+            t = (p.extract_text() or "").strip()
             if t:
                 parts.append(t)
     return "\n\n".join(parts).strip()
 
 
 def clean_to_json_object(raw: str) -> str:
-    """Extract first {...} JSON object (handles ```json fences and extra text)."""
     raw = (raw or "").strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\s*```$", "", raw)
-
     m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     return m.group(0).strip() if m else raw
 
@@ -73,7 +83,7 @@ def safe_float(x: Any) -> Optional[float]:
     s = str(x).strip()
     if not s:
         return None
-    s = re.sub(r"[^\d.\-]", "", s)  # keep digits dot minus
+    s = re.sub(r"[^\d.\-]", "", s)
     try:
         return float(s)
     except:
@@ -81,7 +91,6 @@ def safe_float(x: Any) -> Optional[float]:
 
 
 def normalize_extracted(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Make sure keys exist and numbers are clean."""
     vendor_name = (d.get("vendor_name") or "").strip()
     invoice_number = (d.get("invoice_number") or "").strip()
     invoice_date = (d.get("invoice_date") or "").strip()
@@ -92,7 +101,6 @@ def normalize_extracted(d: Dict[str, Any]) -> Dict[str, Any]:
     tax = safe_float(d.get("tax"))
     total = safe_float(d.get("total"))
 
-    # If total missing but subtotal+tax exists
     if total is None and subtotal is not None and tax is not None:
         total = subtotal + tax
 
@@ -117,7 +125,6 @@ def normalize_extracted(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def openai_extract(text: str) -> Dict[str, Any]:
-    """OpenAI → strict JSON extraction."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY missing")
 
@@ -159,8 +166,7 @@ def get_gspread_client() -> gspread.Client:
 
 def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ✅ This is the FIX:
-    Writes to sheet by matching your header names, not position.
+    Writes to sheet by matching your header names (Row 1) EXACTLY.
     Your headers:
     invoice_number, invoice_data, vendor_name, invoice_amount, due_date, currency, subtotal, tax, total
     """
@@ -174,12 +180,11 @@ def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
     headers = ws.row_values(1)
     norm_headers = [h.strip().lower() for h in headers]
 
-    # Map EXACTLY to your sheet headers
     row_map = {
         "invoice_number": extracted.get("invoice_number", ""),
-        "invoice_data": extracted.get("invoice_date", ""),   # your sheet calls it invoice_data
+        "invoice_data": extracted.get("invoice_date", ""),   # your sheet uses invoice_data
         "vendor_name": extracted.get("vendor_name", ""),
-        "invoice_amount": extracted.get("total", ""),        # your sheet calls amount = total
+        "invoice_amount": extracted.get("total", ""),        # your sheet uses invoice_amount
         "due_date": extracted.get("due_date", ""),
         "currency": extracted.get("currency", ""),
         "subtotal": extracted.get("subtotal", ""),
@@ -190,8 +195,11 @@ def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
     row = [row_map.get(h, "") for h in norm_headers]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
+    # last row number (simple approach)
+    last_row = len(ws.get_all_values())
     return {
         "sheet_status": "row_appended",
+        "sheet_row": last_row,
         "worksheet_used": WORKSHEET_NAME,
         "service_account_file_used": os.path.basename(SERVICE_ACCOUNT_FILE),
     }
@@ -202,16 +210,12 @@ def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    """
-    Zapier must send multipart/form-data with field name: file
-    """
     try:
         pdf_bytes = await file.read()
         text = extract_text_from_pdf(pdf_bytes)
 
-        preview = text[:800] if text else ""
-        # If PDF has no text (scanned), this will be weak -> OCR is the next upgrade
-        model_out = openai_extract(text if text else preview)
+        # If empty text, OCR is the next upgrade. For now still try with what we have.
+        model_out = openai_extract(text if text else "")
         extracted = normalize_extracted(model_out)
 
         sheet_info = append_row_by_headers(extracted)
@@ -224,7 +228,6 @@ async def upload(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        # Return 200 so Zapier doesn't hard-fail; you can switch to 500 later.
         return JSONResponse(
             status_code=200,
             content={
