@@ -1,75 +1,40 @@
-from fastapi import FastAPI, UploadFile, File
-import io
-import json
-import re
 import os
+import re
+import json
+from io import BytesIO
+from typing import Any, Dict, List, Optional
 
 import pdfplumber
-from dotenv import load_dotenv
-from openai import OpenAI
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Loads .env locally (Render env vars also work automatically)
-load_dotenv()
+from openai import OpenAI
 
+
+# =========================
+# CONFIG (Environment Vars)
+# =========================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+SHEET_ID = os.getenv("SHEET_ID", "")  # Google Sheet ID (from URL)
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "invoices")
+
+# Render Secret File path is usually /etc/secrets/<filename>
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_account.json")
+
+# If running locally and you keep the file in project folder:
+if not os.path.exists(SERVICE_ACCOUNT_FILE) and os.path.exists("service_account.json"):
+    SERVICE_ACCOUNT_FILE = "service_account.json"
+
+
+# =========================
+# APP
+# =========================
 app = FastAPI()
-
-# -------- ENV VARS --------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1")
-
-# On Render: /etc/secrets/service_account.json
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
-
-# -------- CLIENTS --------
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-def clean_text(t: str) -> str:
-    # Fix weird repeated letters caused by some PDF fonts
-    t = re.sub(r'([A-Za-z])\1{2,}', r'\1', t)
-    t = re.sub(r'\s+', ' ', t)
-    return t.strip()
-
-
-def extract_json(text: str) -> str:
-    """
-    Removes ```json fences and returns only the JSON object if possible.
-    """
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
-    return text
-
-
-def get_sheet():
-    """
-    Connect to Google Sheets using service account key file.
-    """
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-
-    # Use the configured worksheet name if it exists, otherwise fallback to first tab
-    try:
-        ws = sh.worksheet(GOOGLE_WORKSHEET_NAME)
-    except Exception:
-        ws = sh.get_worksheet(0)
-
-    return ws
 
 
 @app.get("/")
@@ -77,122 +42,226 @@ def home():
     return {"status": "ok", "message": "server running"}
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    # -------- sanity checks --------
-    if not OPENAI_API_KEY:
-        return {"error": "Missing OPENAI_API_KEY (set it in Render env vars or .env)"}
-    if not GOOGLE_SHEET_ID:
-        return {"error": "Missing GOOGLE_SHEET_ID (set it in Render env vars or .env)"}
-
-    if file.content_type not in ["application/pdf", "application/octet-stream"]:
-        return {"error": f"Please upload a PDF. Got content_type={file.content_type}"}
-
-    pdf_bytes = await file.read()
-
-    # -------- 1) PDF text extraction --------
-    text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+# =========================
+# HELPERS
+# =========================
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extract text from a PDF using pdfplumber."""
+    text_parts: List[str] = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            text += (page.extract_text() or "") + "\n"
+            t = page.extract_text() or ""
+            if t.strip():
+                text_parts.append(t)
+    return "\n\n".join(text_parts).strip()
 
-    if len(text.strip()) == 0:
-        return {
-            "filename": file.filename,
-            "size_bytes": len(pdf_bytes),
-            "error": "No text found. Likely scanned PDF (image). Needs OCR."
-        }
 
-    text = clean_text(text)
+def clean_model_json(raw: str) -> str:
+    """
+    If the model returns ```json ... ``` or extra text, extract JSON object.
+    """
+    raw = raw.strip()
 
-    # -------- 2) OpenAI -> JSON --------
-    schema_hint = {
-        "vendor_name": "",
-        "invoice_number": "",
-        "invoice_date": "",
-        "due_date": "",
-        "currency": "",
-        "subtotal": "",
-        "tax": "",
-        "total": "",
-        "line_items": []
+    # Remove code fences
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    # Try to find first {...} block
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        return match.group(0).strip()
+
+    return raw
+
+
+def safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if not s:
+        return None
+    # remove currency symbols/commas
+    s = re.sub(r"[^\d.\-]", "", s)
+    try:
+        return float(s)
+    except:
+        return None
+
+
+def normalize_extracted(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure keys exist and totals are consistent.
+    """
+    vendor_name = (data.get("vendor_name") or "").strip()
+    invoice_number = (data.get("invoice_number") or "").strip()
+    invoice_date = (data.get("invoice_date") or "").strip()
+    due_date = (data.get("due_date") or "").strip()
+    currency = (data.get("currency") or "").strip().upper()
+
+    subtotal = safe_float(data.get("subtotal"))
+    tax = safe_float(data.get("tax"))
+    total = safe_float(data.get("total"))
+
+    # If total missing but subtotal + tax present, compute
+    if total is None and subtotal is not None and tax is not None:
+        total = subtotal + tax
+
+    # Default numeric blanks to empty strings (Sheets friendly)
+    def num_out(v: Optional[float]) -> str:
+        return "" if v is None else str(v)
+
+    line_items = data.get("line_items") or []
+    if not isinstance(line_items, list):
+        line_items = []
+
+    return {
+        "vendor_name": vendor_name,
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
+        "due_date": due_date,
+        "currency": currency,
+        "subtotal": num_out(subtotal),
+        "tax": num_out(tax),
+        "total": num_out(total),
+        "line_items": line_items,
     }
 
-    prompt = f"""
-Extract invoice fields from the text below.
-Return ONLY valid JSON. No commentary. No markdown.
 
-If a field is missing, use "".
-Dates as YYYY-MM-DD if possible.
-Numbers as strings.
+def openai_extract(invoice_text: str) -> Dict[str, Any]:
+    """
+    Call OpenAI to extract structured invoice JSON.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing")
 
-Expected JSON shape example:
-{json.dumps(schema_hint, indent=2)}
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-INVOICE TEXT:
-{text}
-"""
-
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt
+    # Keep prompt simple + strict
+    system = (
+        "You extract invoice fields from raw text. "
+        "Return ONLY valid JSON object with keys:\n"
+        "vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, line_items.\n"
+        "line_items is an array of objects: description, quantity, unit_price, amount.\n"
+        "If unknown, use empty string or empty array."
     )
 
-    output_text = resp.output_text.strip()
-    json_str = extract_json(output_text)
+    user = f"INVOICE TEXT:\n{invoice_text}"
 
+    # response_format json_object makes it output strict JSON (when supported)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+
+    content = resp.choices[0].message.content or "{}"
+    content = clean_model_json(content)
+    parsed = json.loads(content)
+    return parsed
+
+
+def get_gspread_client() -> gspread.Client:
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise RuntimeError(f"Service account file not found: {SERVICE_ACCOUNT_FILE}")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Append a row to Google Sheets by matching header names (row 1).
+    This prevents wrong columns forever.
+    """
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID missing")
+
+    gc = get_gspread_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(WORKSHEET_NAME)
+
+    headers = ws.row_values(1)
+
+    # Support BOTH your sheet names + our extracted keys:
+    # Your sheet has: invoice_data, invoice_amount
+    row_map = {
+        "vendor_name": extracted.get("vendor_name", ""),
+        "invoice_number": extracted.get("invoice_number", ""),
+
+        # handle both spellings:
+        "invoice_date": extracted.get("invoice_date", ""),
+        "invoice_data": extracted.get("invoice_date", ""),  # if your header is invoice_data
+
+        "due_date": extracted.get("due_date", ""),
+        "currency": extracted.get("currency", ""),
+
+        "subtotal": extracted.get("subtotal", ""),
+        "tax": extracted.get("tax", ""),
+        "total": extracted.get("total", ""),
+
+        # if your sheet wants invoice_amount, map it to total:
+        "invoice_amount": extracted.get("total", ""),
+    }
+
+    # Build row in the same order as headers
+    row = [row_map.get(h, "") for h in headers]
+
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    last_row = len(ws.get_all_values())  # simple way to return row index
+
+    return {
+        "sheet_status": "row_appended",
+        "sheet_row": last_row,
+        "worksheet_used": WORKSHEET_NAME,
+        "service_account_file_used": os.path.basename(SERVICE_ACCOUNT_FILE),
+    }
+
+
+# =========================
+# ROUTES
+# =========================
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    """
+    Zapier sends multipart/form-data with field name: file
+    """
     try:
-        data = json.loads(json_str)
-    except Exception:
+        pdf_bytes = await file.read()
+        text = extract_text_from_pdf(pdf_bytes)
+
+        # Keep preview short
+        preview = (text[:800] + "…") if len(text) > 800 else text
+
+        # If PDF has almost no text, extraction will be weak (OCR is next upgrade)
+        # Still send it to OpenAI so you can see behavior.
+        model_out = openai_extract(text if text else preview)
+        extracted = normalize_extracted(model_out)
+
+        sheet_info = append_row_by_headers(extracted)
+
         return {
             "filename": file.filename,
             "chars": len(text),
-            "preview": text[:700],
-            "raw_model_output": output_text[:2000],
-            "error": "Model did not return valid JSON"
+            "preview": preview,
+            "extracted": extracted,
+            **sheet_info,
         }
-
-    # -------- 3) Write to Google Sheets --------
-    try:
-        ws = get_sheet()
-
-        row = [
-            data.get("vendor_name", ""),
-            data.get("invoice_number", ""),
-            data.get("invoice_date", ""),
-            data.get("due_date", ""),
-            data.get("currency", ""),
-            data.get("subtotal", ""),
-            data.get("tax", ""),
-            data.get("total", ""),
-        ]
-
-        ws.append_row(row, value_input_option="USER_ENTERED")
-
-        # row number after append (simple way)
-        sheet_row = len(ws.get_all_values())
 
     except Exception as e:
-        return {
-            "filename": file.filename,
-            "extracted": data,
-            "service_account_file_used": SERVICE_ACCOUNT_FILE,
-            "sheet_id_used": GOOGLE_SHEET_ID,
-            "worksheet_used": GOOGLE_WORKSHEET_NAME,
-            "error": f"Google Sheets write failed: {str(e)}"
-        }
-
-    return {
-        "filename": file.filename,
-        "chars": len(text),
-        "extracted": data,
-        "sheet_status": "row_appended",
-        "sheet_row": sheet_row,
-        "service_account_file_used": SERVICE_ACCOUNT_FILE,
-        "worksheet_used": GOOGLE_WORKSHEET_NAME
-    }
+        return JSONResponse(
+            status_code=200,  # keep 200 so Zapier doesn't hard-fail; you can change to 500 later
+            content={
+                "filename": getattr(file, "filename", ""),
+                "error": str(e),
+            },
+        )
