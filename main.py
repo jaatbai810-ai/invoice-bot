@@ -178,10 +178,10 @@ def get_gspread_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
+def append_row_by_headers(extracted: dict) -> dict:
     """
-    Append a row to Google Sheets by matching header names (row 1).
-    This prevents wrong columns forever.
+    Appends by matching your Sheet headers EXACTLY (row 1).
+    Fixes the column shift problem permanently.
     """
     if not SHEET_ID:
         raise RuntimeError("SHEET_ID missing")
@@ -190,34 +190,29 @@ def append_row_by_headers(extracted: Dict[str, Any]) -> Dict[str, Any]:
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet(WORKSHEET_NAME)
 
+    # Read header row
     headers = ws.row_values(1)
+    # Normalize (handles extra spaces/case)
+    norm_headers = [h.strip().lower() for h in headers]
 
-    # Support BOTH your sheet names + our extracted keys:
-    # Your sheet has: invoice_data, invoice_amount
+    # Build a map that matches YOUR headers
     row_map = {
-        "vendor_name": extracted.get("vendor_name", ""),
         "invoice_number": extracted.get("invoice_number", ""),
-
-        # handle both spellings:
-        "invoice_date": extracted.get("invoice_date", ""),
-        "invoice_data": extracted.get("invoice_date", ""),  # if your header is invoice_data
-
+        "invoice_data": extracted.get("invoice_date", ""),   # your header uses invoice_data
+        "vendor_name": extracted.get("vendor_name", ""),
+        "invoice_amount": extracted.get("total", ""),        # your header uses invoice_amount
         "due_date": extracted.get("due_date", ""),
         "currency": extracted.get("currency", ""),
-
         "subtotal": extracted.get("subtotal", ""),
         "tax": extracted.get("tax", ""),
         "total": extracted.get("total", ""),
-
-        # if your sheet wants invoice_amount, map it to total:
-        "invoice_amount": extracted.get("total", ""),
     }
 
-    # Build row in the same order as headers
-    row = [row_map.get(h, "") for h in headers]
+    # Build row in the same order as the sheet headers
+    row = [row_map.get(h, "") for h in norm_headers]
 
     ws.append_row(row, value_input_option="USER_ENTERED")
-    last_row = len(ws.get_all_values())  # simple way to return row index
+    last_row = len(ws.get_all_values())
 
     return {
         "sheet_status": "row_appended",
