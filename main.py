@@ -23,18 +23,14 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SHEET_ID = os.getenv("SHEET_ID")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "invoices")
 
-# Render secret file path
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/secrets/service_account.json")
 
 app = FastAPI()
 
 
-# ======================
-# ROUTES
-# ======================
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "server running", "version": "dedupe-v1"}
+    return {"status": "ok", "message": "server running", "version": "filehash-dedupe-v1"}
 
 
 # ======================
@@ -75,7 +71,7 @@ def normalize(s: str) -> str:
 def looks_like_template(extracted: dict, raw_text: str) -> bool:
     text = (raw_text or "").lower()
 
-    markers = ["template", "sample", "lorem", "enter date", "enter invoice", "placeholder"]
+    markers = ["template", "lorem", "enter date", "enter invoice", "placeholder"]
     if any(m in text for m in markers):
         return True
 
@@ -85,6 +81,7 @@ def looks_like_template(extracted: dict, raw_text: str) -> bool:
     if "[" in vendor or "]" in vendor or "[" in inv or "]" in inv:
         return True
 
+    # Hard skip if these are missing (template-ish)
     if not vendor or vendor in {"n/a", "na", "none", "null"}:
         return True
     if not inv or inv in {"n/a", "na", "none", "null"}:
@@ -96,7 +93,11 @@ def looks_like_template(extracted: dict, raw_text: str) -> bool:
     return False
 
 
-def make_dedupe_key(extracted: dict, raw_text: str) -> str:
+def make_dedupe_key(extracted: dict) -> str:
+    """
+    Human-readable dedupe key (not perfect).
+    We'll use file_hash as the real dedupe.
+    """
     vendor = normalize(extracted.get("vendor_name", ""))
     inv = normalize(extracted.get("invoice_number", ""))
     total = extracted.get("total")
@@ -108,12 +109,7 @@ def make_dedupe_key(extracted: dict, raw_text: str) -> str:
     except Exception:
         total_str = ""
 
-    if vendor and inv and total_str:
-        return f"{vendor}|{inv}|{total_str}"
-
-    preview = (raw_text or "")[:2000].encode("utf-8", errors="ignore")
-    h = hashlib.sha256(preview).hexdigest()[:16]
-    return f"{vendor or 'unknown'}|{inv or h}|{total_str or '0.00'}"
+    return f"{vendor}|{inv}|{total_str}"
 
 
 def openai_extract_invoice(text: str) -> Dict[str, Any]:
@@ -142,12 +138,11 @@ TEXT:
 
     data = json.loads(resp.choices[0].message.content or "{}")
 
-    # normalize number fields
     data["subtotal"] = coerce_float(data.get("subtotal"))
     data["tax"] = coerce_float(data.get("tax"))
     data["total"] = coerce_float(data.get("total"))
 
-    # doc_type optional (default invoice)
+    # default
     data["doc_type"] = (data.get("doc_type") or "invoice").strip().lower()
 
     return data
@@ -189,44 +184,42 @@ def col_to_letter(n: int) -> str:
     return s
 
 
-def dedupe_exists(ws, headers: List[str], dedupe_key: str, lookback: int = 2000) -> bool:
-    if "dedupe_key" not in headers:
+def column_contains_value(ws, headers: List[str], header_name: str, value: str, lookback: int = 2000) -> bool:
+    if header_name not in headers:
         return False
 
-    idx = headers.index("dedupe_key") + 1
+    idx = headers.index(header_name) + 1
     col = col_to_letter(idx)
-
     vals = ws.get(f"{col}2:{col}")
     flat = [(r[0] or "").strip() for r in vals if r and len(r) > 0]
-
     if not flat:
         return False
-
     last = flat[-lookback:] if len(flat) > lookback else flat
-    return dedupe_key in last
+    return value in last
 
 
-def build_row(headers: List[str], extracted: Dict[str, Any], dedupe_key: str) -> List[str]:
+def build_row(headers: List[str], extracted: Dict[str, Any], dedupe_key: str, file_hash: str, status: str, reason: str) -> List[str]:
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Your sheet mapping (IMPORTANT)
     values_map = {
+        # your existing columns + mapping
         "invoice_number": extracted.get("invoice_number"),
-        "invoice_data": extracted.get("invoice_date"),   # your special mapping
+        "invoice_data": extracted.get("invoice_date"),
         "vendor_name": extracted.get("vendor_name"),
-        "invoice_amount": extracted.get("total"),        # your special mapping
+        "invoice_amount": extracted.get("total"),
         "due_date": extracted.get("due_date"),
         "currency": extracted.get("currency"),
         "subtotal": extracted.get("subtotal"),
         "tax": extracted.get("tax"),
         "total": extracted.get("total"),
 
-        # extra columns
+        # extras
+        "file_hash": file_hash,
         "dedupe_key": dedupe_key,
-        "status": "processed",
-        "pdf_url": "",  # fill later
+        "status": status,
+        "pdf_url": "",  # you can fill later
         "doc_type": extracted.get("doc_type", "invoice"),
-        "reason": "",
+        "reason": reason,
         "processed_at": now_iso,
     }
 
@@ -246,45 +239,52 @@ async def upload(file: UploadFile = File(...)):
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # 1) extract pdf text
-    raw_text = extract_text(pdf_bytes)
+    # PRIMARY dedupe based on PDF bytes (perfect)
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
-    # 2) openai extraction
+    raw_text = extract_text(pdf_bytes)
     extracted = openai_extract_invoice(raw_text)
 
-    # 3) template skip
+    # Template skip
     if looks_like_template(extracted, raw_text):
         return {
             **extracted,
+            "file_hash": file_hash,
             "sheet_status": "skipped_template",
             "status": "skipped_template",
             "reason": "Looks like a blank/template invoice (placeholders detected).",
         }
 
-    # 4) dedupe key
-    dedupe_key = make_dedupe_key(extracted, raw_text)
+    dedupe_key = make_dedupe_key(extracted)
 
-    # 5) open sheet + headers
     ws = open_sheet()
     headers = get_headers(ws)
 
-    # 6) dedupe check
-    if dedupe_exists(ws, headers, dedupe_key):
+    # Dedupe: if file_hash column exists, use it
+    if column_contains_value(ws, headers, "file_hash", file_hash):
         return {
             **extracted,
+            "file_hash": file_hash,
             "dedupe_key": dedupe_key,
             "sheet_status": "skipped_duplicate",
             "status": "skipped_duplicate",
-            "reason": "duplicate invoice detected",
+            "reason": "duplicate pdf detected (file_hash match)",
         }
 
-    # 7) append header-mapped row (fills extra columns)
-    row = build_row(headers, extracted, dedupe_key)
+    # Append row
+    row = build_row(
+        headers=headers,
+        extracted=extracted,
+        dedupe_key=dedupe_key,
+        file_hash=file_hash,
+        status="processed",
+        reason="",
+    )
     ws.append_row(row, value_input_option="USER_ENTERED")
 
-    # 8) return (so Zapier step 4 shows dedupe_key)
     return {
         **extracted,
+        "file_hash": file_hash,
         "dedupe_key": dedupe_key,
         "sheet_status": "row_appended",
         "status": "processed",
