@@ -23,6 +23,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SHEET_ID = os.getenv("SHEET_ID")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "invoices")
 
+# Render secret file path
 SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/secrets/service_account.json")
 
 app = FastAPI()
@@ -30,7 +31,7 @@ app = FastAPI()
 
 @app.get("/")
 def health():
-    return {"status": "ok", "message": "server running", "version": "filehash-dedupe-v1"}
+    return {"status": "ok", "message": "server running", "version": "filehash-dedupe-needsreview-v1"}
 
 
 # ======================
@@ -71,6 +72,7 @@ def normalize(s: str) -> str:
 def looks_like_template(extracted: dict, raw_text: str) -> bool:
     text = (raw_text or "").lower()
 
+    # Keep this list conservative (avoid false positives)
     markers = ["template", "lorem", "enter date", "enter invoice", "placeholder"]
     if any(m in text for m in markers):
         return True
@@ -81,7 +83,6 @@ def looks_like_template(extracted: dict, raw_text: str) -> bool:
     if "[" in vendor or "]" in vendor or "[" in inv or "]" in inv:
         return True
 
-    # Hard skip if these are missing (template-ish)
     if not vendor or vendor in {"n/a", "na", "none", "null"}:
         return True
     if not inv or inv in {"n/a", "na", "none", "null"}:
@@ -94,10 +95,6 @@ def looks_like_template(extracted: dict, raw_text: str) -> bool:
 
 
 def make_dedupe_key(extracted: dict) -> str:
-    """
-    Human-readable dedupe key (not perfect).
-    We'll use file_hash as the real dedupe.
-    """
     vendor = normalize(extracted.get("vendor_name", ""))
     inv = normalize(extracted.get("invoice_number", ""))
     total = extracted.get("total")
@@ -142,7 +139,6 @@ TEXT:
     data["tax"] = coerce_float(data.get("tax"))
     data["total"] = coerce_float(data.get("total"))
 
-    # default
     data["doc_type"] = (data.get("doc_type") or "invoice").strip().lower()
 
     return data
@@ -165,7 +161,6 @@ def open_sheet():
 
 
 def clean_header(h: str) -> str:
-    # remove normal + non-breaking spaces
     return (h or "").replace("\u00A0", " ").strip()
 
 
@@ -198,26 +193,31 @@ def column_contains_value(ws, headers: List[str], header_name: str, value: str, 
     return value in last
 
 
-def build_row(headers: List[str], extracted: Dict[str, Any], dedupe_key: str, file_hash: str, status: str, reason: str) -> List[str]:
+def build_row(
+    headers: List[str],
+    extracted: Dict[str, Any],
+    dedupe_key: str,
+    file_hash: str,
+    status: str,
+    reason: str,
+) -> List[str]:
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # IMPORTANT: mapping matches your sheet
     values_map = {
-        # your existing columns + mapping
-        "invoice_number": extracted.get("invoice_number"),
-        "invoice_data": extracted.get("invoice_date"),
         "vendor_name": extracted.get("vendor_name"),
-        "invoice_amount": extracted.get("total"),
+        "invoice_number": extracted.get("invoice_number"),
+        "invoice_date": extracted.get("invoice_date"),
         "due_date": extracted.get("due_date"),
         "currency": extracted.get("currency"),
         "subtotal": extracted.get("subtotal"),
         "tax": extracted.get("tax"),
         "total": extracted.get("total"),
 
-        # extras
         "file_hash": file_hash,
         "dedupe_key": dedupe_key,
         "status": status,
-        "pdf_url": "",  # you can fill later
+        "pdf_url": "",  # Zapier will fill
         "doc_type": extracted.get("doc_type", "invoice"),
         "reason": reason,
         "processed_at": now_iso,
@@ -239,9 +239,10 @@ async def upload(file: UploadFile = File(...)):
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # PRIMARY dedupe based on PDF bytes (perfect)
+    # Perfect dedupe on PDF bytes
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
+    # Extract text + fields
     raw_text = extract_text(pdf_bytes)
     extracted = openai_extract_invoice(raw_text)
 
@@ -255,12 +256,27 @@ async def upload(file: UploadFile = File(...)):
             "reason": "Looks like a blank/template invoice (placeholders detected).",
         }
 
+    # Human-readable dedupe key
     dedupe_key = make_dedupe_key(extracted)
 
+    # Needs-review logic (do not block pipeline)
+    missing = []
+    if not (extracted.get("invoice_number") or "").strip():
+        missing.append("invoice_number")
+    if extracted.get("total") in (None, "", "null"):
+        missing.append("total")
+    if not (extracted.get("currency") or "").strip():
+        missing.append("currency")
+
+    needs_review = len(missing) > 0
+    status_value = "needs_review" if needs_review else "processed"
+    reason_value = ("missing: " + ", ".join(missing)) if needs_review else ""
+
+    # Open sheet + headers
     ws = open_sheet()
     headers = get_headers(ws)
 
-    # Dedupe: if file_hash column exists, use it
+    # Dedupe check (skip duplicates)
     if column_contains_value(ws, headers, "file_hash", file_hash):
         return {
             **extracted,
@@ -271,21 +287,23 @@ async def upload(file: UploadFile = File(...)):
             "reason": "duplicate pdf detected (file_hash match)",
         }
 
-    # Append row
+    # Append row (fills status/reason/processed_at/file_hash)
     row = build_row(
         headers=headers,
         extracted=extracted,
         dedupe_key=dedupe_key,
         file_hash=file_hash,
-        status="processed",
-        reason="",
+        status=status_value,
+        reason=reason_value,
     )
     ws.append_row(row, value_input_option="USER_ENTERED")
 
+    # Return values for Zapier mapping
     return {
         **extracted,
         "file_hash": file_hash,
         "dedupe_key": dedupe_key,
         "sheet_status": "row_appended",
-        "status": "processed",
+        "status": status_value,
+        "reason": reason_value,
     }
