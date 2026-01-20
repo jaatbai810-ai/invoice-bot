@@ -10,22 +10,17 @@ from typing import Dict, Any, List, Tuple, Optional
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 
-# PDF text extraction
 import pdfplumber
 
-# Google APIs
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# OpenAI (new SDK)
-# pip install openai
 from openai import OpenAI
 
-
-APP_VERSION = "filehash-dedupe-needsreview-v2-strict-template"
+APP_VERSION = "filehash-dedupe-needsreview-v3-rownumber"
 
 # ----------------------------
-# Strict template detection
+# STRICT TEMPLATE DETECTION
 # ----------------------------
 
 TEMPLATE_STRICT_KEYWORDS = [
@@ -61,8 +56,8 @@ TEMPLATE_STRICT_PATTERNS = [
 
 def is_explicit_template_strict(raw_text: str) -> bool:
     """
-    ONLY skip if we see explicit template/placeholder signals.
-    Never skip because fields are missing or invoice is messy.
+    ONLY skip if explicit template/placeholder signals exist.
+    Never skip due to missing fields or messy formatting.
     """
     if not raw_text:
         return False  # scanned/empty -> needs_review, NOT skipped
@@ -81,7 +76,7 @@ def is_explicit_template_strict(raw_text: str) -> bool:
 
 
 # ----------------------------
-# Helpers
+# HELPERS
 # ----------------------------
 
 def now_iso() -> str:
@@ -93,34 +88,29 @@ def short_sha256(data: bytes, n: int = 16) -> str:
 def safe_str(x) -> str:
     if x is None:
         return ""
-    if isinstance(x, (int, float)):
-        return str(x)
     return str(x).strip()
 
 def build_dedupe_key(vendor: str, invoice_number: str, total: str) -> str:
-    v = safe_str(vendor).lower()
-    i = safe_str(invoice_number).lower()
-    t = safe_str(total).lower()
-    return f"{v}|{i}|{t}"
+    return f"{safe_str(vendor).lower()}|{safe_str(invoice_number).lower()}|{safe_str(total).lower()}"
 
 def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 5) -> str:
     """
-    Extract text from first N pages. If scanned, this will be empty/short.
+    Extract text from first N pages. Scanned PDFs usually return empty/short text.
     """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            texts = []
-            for idx, page in enumerate(pdf.pages[:max_pages]):
+            parts = []
+            for page in pdf.pages[:max_pages]:
                 txt = page.extract_text() or ""
-                if txt:
-                    texts.append(txt)
-            return "\n".join(texts).strip()
+                if txt.strip():
+                    parts.append(txt)
+            return "\n".join(parts).strip()
     except Exception:
         return ""
 
 
 # ----------------------------
-# OpenAI extraction
+# OPENAI EXTRACTION
 # ----------------------------
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -139,21 +129,18 @@ EXTRACTION_SCHEMA = {
 
 def extract_invoice_fields_with_openai(client: OpenAI, raw_text: str) -> Dict[str, Any]:
     """
-    Uses the PDF text layer. If text is empty, we still return blanks (needs_review).
+    Uses PDF text layer only. If text is empty, returns blanks (needs_review).
     """
-    # Keep prompt strict: return JSON only
     sys = (
-        "You extract invoice fields from text. "
-        "Return ONLY valid JSON with these keys:\n"
+        "Extract invoice fields from text. Return ONLY valid JSON with keys:\n"
         "vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, doc_type\n"
         "Rules:\n"
-        "- Use ISO date format YYYY-MM-DD when possible.\n"
-        "- If unknown, return empty string.\n"
-        "- doc_type should be 'invoice' unless clearly 'credit_note' or 'statement'.\n"
+        "- Dates -> YYYY-MM-DD when possible.\n"
+        "- If unknown -> empty string.\n"
+        "- doc_type -> 'invoice' unless clearly 'credit_note' or 'statement'.\n"
         "- No extra keys."
     )
-
-    user = f"Invoice text:\n\n{raw_text[:20000]}"  # cap
+    user = f"Invoice text:\n\n{raw_text[:20000]}"
 
     try:
         resp = client.chat.completions.create(
@@ -167,22 +154,15 @@ def extract_invoice_fields_with_openai(client: OpenAI, raw_text: str) -> Dict[st
         content = resp.choices[0].message.content.strip()
         data = json.loads(content)
 
-        # Normalize: ensure all keys exist
         out = dict(EXTRACTION_SCHEMA)
         for k in out.keys():
             if k in data:
                 out[k] = safe_str(data.get(k))
         return out
     except Exception:
-        # If OpenAI fails, return blanks -> needs_review
         return dict(EXTRACTION_SCHEMA)
 
-
 def missing_fields(extracted: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """
-    Core missing -> triggers needs_review.
-    Optional missing -> included in reason.
-    """
     core = ["vendor_name", "invoice_date", "total"]
     optional = ["invoice_number", "currency", "due_date", "subtotal", "tax"]
 
@@ -192,11 +172,14 @@ def missing_fields(extracted: Dict[str, Any]) -> Tuple[List[str], List[str]]:
 
 
 # ----------------------------
-# Google Sheets
+# GOOGLE SHEETS
 # ----------------------------
 
+# Use YOUR env vars. Supports your current names + my old names.
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
-SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1").strip()
+
+# You have GOOGLE_WORKSHEET_NAME; we also support SHEET_NAME
+SHEET_NAME = (os.getenv("SHEET_NAME") or os.getenv("GOOGLE_WORKSHEET_NAME") or "Sheet1").strip()
 
 REQUIRED_HEADERS = [
     "vendor_name","invoice_number","invoice_date","due_date","currency","subtotal","tax","total",
@@ -205,18 +188,29 @@ REQUIRED_HEADERS = [
 
 def get_google_creds() -> Credentials:
     """
-    Env var options:
-    - GOOGLE_SERVICE_ACCOUNT_JSON: full JSON string
-    OR
-    - GOOGLE_SERVICE_ACCOUNT_FILE: path to json file
+    Supported ways to provide credentials:
+
+    1) GOOGLE_SERVICE_ACCOUNT_JSON (full JSON string)  [optional]
+    2) GOOGLE_SERVICE_ACCOUNT_FILE (path to json)      [recommended with Render secret file]
+    3) GOOGLE_APPLICATION_CREDENTIALS (path to json)   [common Google style]
+
+    For Render Secret Files:
+      filename: service_account.json
+      path: /etc/secrets/service_account.json
     """
     js = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    jf = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        # Drive scope not needed if webhook isn't uploading to Drive
-    ]
+    # prefer explicit file envs
+    jf = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    if not jf:
+        # fall back to standard google env var
+        jf = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+    # If you stored secret file and forgot to set path env var, try default
+    if not jf and os.path.exists("/etc/secrets/service_account.json"):
+        jf = "/etc/secrets/service_account.json"
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
     if js:
         info = json.loads(js)
@@ -225,7 +219,7 @@ def get_google_creds() -> Credentials:
     if jf:
         return Credentials.from_service_account_file(jf, scopes=scopes)
 
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE")
+    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE (or GOOGLE_APPLICATION_CREDENTIALS)")
 
 def sheets_service():
     creds = get_google_creds()
@@ -238,7 +232,6 @@ def read_headers(svc) -> List[str]:
     return values[0] if values else []
 
 def ensure_headers_ok(headers: List[str]) -> Optional[str]:
-    # strict match by name (order matters for your mapping)
     if headers != REQUIRED_HEADERS:
         return (
             "Sheet headers do not match required Row 1 exactly.\n"
@@ -247,26 +240,19 @@ def ensure_headers_ok(headers: List[str]) -> Optional[str]:
         )
     return None
 
+def col_to_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
 def find_existing_by_file_hash(svc, headers: List[str], file_hash: str) -> bool:
     """
-    Simple dedupe: scan the file_hash column.
-    For V1 scale this is fine. For huge sheets, optimize later.
+    Dedupe by file_hash column scan.
     """
-    try:
-        idx = headers.index("file_hash")  # 0-based
-    except ValueError:
-        return False
-
-    # Column letter: A=1 -> convert idx to letter
-    col = idx + 1
-    def col_to_letter(n: int) -> str:
-        s = ""
-        while n:
-            n, r = divmod(n - 1, 26)
-            s = chr(65 + r) + s
-        return s
-
-    letter = col_to_letter(col)
+    idx = headers.index("file_hash")  # 0-based
+    letter = col_to_letter(idx + 1)
     rng = f"{SHEET_NAME}!{letter}:{letter}"
     res = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
     col_vals = [row[0] for row in res.get("values", [])[1:] if row]  # skip header row
@@ -283,9 +269,19 @@ def append_row(svc, headers: List[str], row_dict: Dict[str, Any]) -> None:
         body=body,
     ).execute()
 
+def get_last_row_number(svc) -> int:
+    """
+    Returns last used row number (including header row).
+    """
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{SHEET_NAME}!A:A"
+    ).execute()
+    return len(res.get("values", []))
+
 
 # ----------------------------
-# FastAPI
+# FASTAPI
 # ----------------------------
 
 app = FastAPI()
@@ -302,7 +298,6 @@ def health():
 async def upload(file: UploadFile = File(...)):
     processed_at = now_iso()
 
-    # Basic validation
     filename = file.filename or "uploaded.pdf"
     content_type = (file.content_type or "").lower()
 
@@ -310,38 +305,35 @@ async def upload(file: UploadFile = File(...)):
     if not pdf_bytes:
         return JSONResponse(
             status_code=400,
-            content={"detail": "Empty file received. Make sure Zapier sends real file blob in multipart/form-data key 'file'."},
+            content={"detail": "Empty file received. Zapier must send real file blob in multipart/form-data key 'file'."},
         )
 
     file_hash = short_sha256(pdf_bytes, n=16)
 
-    # Extract text
     raw_text = extract_pdf_text(pdf_bytes)
 
-    # Strict template skip (ONLY explicit template signals)
+    # STRICT template skip
     if is_explicit_template_strict(raw_text):
-        dedupe_key = build_dedupe_key("", "", "")
         return {
             "sheet_status": "skipped_template",
             "status": "skipped_template",
             "reason": "Explicit template/placeholder text detected (strict rule).",
             "file_hash": file_hash,
-            "dedupe_key": dedupe_key,
+            "dedupe_key": "",
             "processed_at": processed_at,
             "doc_type": "invoice",
             "filename": filename,
             "content_type": content_type,
         }
 
-    # OpenAI extraction (even if raw_text empty -> blanks -> needs_review)
+    # Extract with OpenAI
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        extracted = dict(EXTRACTION_SCHEMA)
-    else:
+    if api_key:
         client = OpenAI(api_key=api_key)
         extracted = extract_invoice_fields_with_openai(client, raw_text)
+    else:
+        extracted = dict(EXTRACTION_SCHEMA)
 
-    # Determine needs_review vs processed
     missing_core, missing_optional = missing_fields(extracted)
 
     if not raw_text or len(raw_text.strip()) < 30:
@@ -360,9 +352,7 @@ async def upload(file: UploadFile = File(...)):
         extracted.get("total", ""),
     )
 
-    # Google Sheets
     if not SHEET_ID:
-        # still return extraction for debugging
         return {
             "sheet_status": "needs_review",
             "status": "needs_review",
@@ -376,8 +366,8 @@ async def upload(file: UploadFile = File(...)):
 
     try:
         svc = sheets_service()
-        headers = read_headers(svc)
 
+        headers = read_headers(svc)
         hdr_err = ensure_headers_ok(headers)
         if hdr_err:
             return {
@@ -391,7 +381,7 @@ async def upload(file: UploadFile = File(...)):
                 "extracted": extracted,
             }
 
-        # Primary dedupe: file_hash
+        # Primary dedupe by file_hash
         if find_existing_by_file_hash(svc, headers, file_hash):
             return {
                 "sheet_status": "skipped_duplicate",
@@ -403,7 +393,7 @@ async def upload(file: UploadFile = File(...)):
                 "doc_type": extracted.get("doc_type", "invoice"),
             }
 
-        # Append row (ALWAYS for messy/scanned)
+        # Append row ALWAYS for messy/scanned (not template)
         row = {
             "vendor_name": extracted.get("vendor_name", ""),
             "invoice_number": extracted.get("invoice_number", ""),
@@ -416,13 +406,16 @@ async def upload(file: UploadFile = File(...)):
             "file_hash": file_hash,
             "dedupe_key": dedupe_key,
             "status": status_val,
-            "pdf_url": "",  # Zapier fills after Drive upload
+            "pdf_url": "",  # Zapier fills this after Drive upload
             "doc_type": extracted.get("doc_type", "invoice"),
             "reason": reason,
             "processed_at": processed_at,
         }
 
         append_row(svc, headers, row)
+
+        # GUARANTEED FIX: return row_number so Zapier can update without Lookup
+        row_number = get_last_row_number(svc)
 
         return {
             "sheet_status": "row_appended",
@@ -432,10 +425,10 @@ async def upload(file: UploadFile = File(...)):
             "dedupe_key": dedupe_key,
             "processed_at": processed_at,
             "doc_type": extracted.get("doc_type", "invoice"),
+            "row_number": row_number,
         }
 
     except Exception as e:
-        # Don't break Zapier; return needs_review with error info
         return {
             "sheet_status": "needs_review",
             "status": "needs_review",
