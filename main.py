@@ -438,3 +438,65 @@ async def upload(file: UploadFile = File(...)):
             "processed_at": processed_at,
             "doc_type": extracted.get("doc_type", "invoice"),
         }
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+
+class PdfUrlUpdate(BaseModel):
+    file_hash: str
+    pdf_url: str
+
+@app.post("/update_pdf_url")
+def update_pdf_url(payload: PdfUrlUpdate):
+    file_hash = (payload.file_hash or "").strip()
+    pdf_url = (payload.pdf_url or "").strip()
+
+    if not file_hash or not pdf_url:
+        return JSONResponse(status_code=400, content={"detail": "file_hash and pdf_url are required"})
+
+    if not SHEET_ID:
+        return JSONResponse(status_code=500, content={"detail": "Missing SHEET_ID env var"})
+
+    try:
+        svc = sheets_service()
+        headers = read_headers(svc)
+        hdr_err = ensure_headers_ok(headers)
+        if hdr_err:
+            return JSONResponse(status_code=500, content={"detail": hdr_err})
+
+        # Find row by file_hash
+        file_hash_idx = headers.index("file_hash")
+        file_hash_col = col_to_letter(file_hash_idx + 1)
+        rng = f"{SHEET_NAME}!{file_hash_col}:{file_hash_col}"
+
+        res = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
+        values = res.get("values", [])
+        found_row_number = None
+
+        for i in range(1, len(values)):  # skip header
+            cell = (values[i][0] if values[i] else "").strip()
+            if cell == file_hash:
+                found_row_number = i + 1  # sheet row number
+                break
+
+        if not found_row_number:
+            return JSONResponse(status_code=404, content={"detail": f"Row not found for file_hash={file_hash}"})
+
+        # Update pdf_url cell
+        pdf_url_idx = headers.index("pdf_url")
+        pdf_url_col = col_to_letter(pdf_url_idx + 1)
+        update_range = f"{SHEET_NAME}!{pdf_url_col}{found_row_number}"
+
+        svc.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=update_range,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[pdf_url]]},
+        ).execute()
+
+        return {"status": "ok", "file_hash": file_hash, "row_number": found_row_number, "pdf_url": pdf_url}
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Server error updating pdf_url: {type(e).__name__}: {str(e)}"},
+        )
