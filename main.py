@@ -5,6 +5,7 @@ import re
 import json
 import hashlib
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 
 import pdfplumber
@@ -18,7 +19,7 @@ from google.oauth2.service_account import Credentials
 # -----------------------------
 # Config
 # -----------------------------
-APP_VERSION = "v3-rownumber+updatepdfurl+apikey+reviewpolicy-v4"
+APP_VERSION = "v4-reviewpolicy+melbourne-time"
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
 # Accept either name (you used GOOGLE_WORKSHEET_NAME)
@@ -52,8 +53,11 @@ HEADERS = [
 MIN_TEXT_CHARS = 60
 
 # Stricter "low-text/scanned" detection for review policy
-# (separate from MIN_TEXT_CHARS to avoid false positives)
 LOW_TEXT_REVIEW_COMPACT_CHARS = 250
+
+# Timezone for timestamps
+TZ = ZoneInfo("Australia/Melbourne")
+
 
 # -----------------------------
 # FastAPI app
@@ -66,7 +70,6 @@ app = FastAPI()
 # -----------------------------
 def require_api_key(x_api_key: Optional[str] = Header(default=None)):
     if not API_KEY:
-        # Fail closed for safety
         raise HTTPException(status_code=500, detail="Server misconfigured: missing API_KEY env var")
     if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -99,7 +102,8 @@ def load_service_account_info() -> Dict[str, Any]:
             return json.load(f)
 
     raise RuntimeError(
-        "Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE / GOOGLE_APPLICATION_CREDENTIALS / SECRET_ACCOUNT_FILE"
+        "Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE / "
+        "GOOGLE_APPLICATION_CREDENTIALS / SECRET_ACCOUNT_FILE"
     )
 
 
@@ -138,7 +142,7 @@ def sha256_short(data: bytes, n: int = 16) -> str:
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
-    text_chunks = []
+    text_chunks: List[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text() or ""
@@ -172,7 +176,7 @@ TEMPLATE_PATTERNS = [
     r"\bsample invoice\b",
     r"\bdemo invoice\b",
     r"\bexample invoice\b",
-    r"\b[s]tart typing\b",
+    r"\bstart typing\b",
     r"\bdelete this\b",
     r"\breplace with\b",
     r"\bcompany name here\b",
@@ -196,16 +200,15 @@ def looks_like_template(text: str) -> bool:
 
 
 # -----------------------------
-# Review policy (NEW)
+# Review policy (V4)
 # Mark needs_review if ANY:
 # - invoice_number missing
-# - currency missing (or currency uncertain)
-# - total not explicitly labeled in PDF text ("Total/Amount Due/Balance Due/Grand Total")
+# - currency missing OR currency has no evidence in text
+# - total missing OR total not explicitly labeled (Total/Amount Due/Balance Due/Grand Total/Invoice Total)
 # - scanned/low-text PDF
 # -----------------------------
 TOTAL_LABEL_RE = re.compile(r"\b(total|amount\s+due|balance\s+due|grand\s+total|invoice\s+total)\b", re.IGNORECASE)
 
-# Currency evidence in raw text (symbols or common 3-letter codes)
 CURRENCY_EVIDENCE_RE = re.compile(
     r"\b(AUD|USD|NZD|CAD|EUR|GBP|INR|SGD|HKD)\b|(?:^|\s)[$€£]\s?\d",
     re.IGNORECASE,
@@ -220,48 +223,6 @@ def has_currency_evidence(pdf_text: str) -> bool:
     return bool(CURRENCY_EVIDENCE_RE.search(pdf_text or ""))
 
 
-def review_policy(extracted: Dict[str, Any], pdf_text: str) -> Tuple[str, str]:
-    """
-    Returns (status, reason)
-    status: processed | needs_review
-    reason: semicolon-separated reasons (only when needs_review), otherwise "Processed successfully."
-    """
-    reasons: List[str] = []
-
-    invoice_number = clean_str(extracted.get("invoice_number"))
-    currency = normalize_currency(extracted.get("currency"))
-    total = normalize_amount(extracted.get("total"))
-
-    # Rule 1: invoice_number missing
-    if not invoice_number:
-        reasons.append("invoice_number missing")
-
-    # Rule 2: currency missing (strict) + optional "uncertain" check
-    if not currency:
-        reasons.append("currency missing")
-    else:
-        # If model gave currency but there's no evidence in PDF text, flag uncertainty
-        if not has_currency_evidence(pdf_text):
-            reasons.append("currency uncertain (no currency symbol/code detected in PDF text)")
-
-    # Rule 3: total must be explicitly labeled in PDF text
-    if total:
-        if not has_total_label(pdf_text):
-            reasons.append("total not explicitly labeled (no Total/Amount Due/Balance Due/Grand Total in PDF text; may be inferred)")
-    else:
-        # If total missing, also needs review (practically required)
-        reasons.append("total missing")
-
-    # Rule 4: scanned/low-text PDF
-    if is_low_text_pdf(pdf_text):
-        reasons.append("scanned/low-text PDF (weak text extraction; OCR/manual review needed)")
-
-    if reasons:
-        return "needs_review", "; ".join(reasons)
-
-    return "processed", "Processed successfully."
-
-
 # -----------------------------
 # OpenAI extraction
 # -----------------------------
@@ -271,7 +232,6 @@ def openai_extract(text: str) -> Dict[str, Any]:
       vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, doc_type
     """
     if not OPENAI_API_KEY:
-        # If key missing, return empty so it becomes needs_review
         return {}
 
     try:
@@ -297,7 +257,7 @@ def openai_extract(text: str) -> Dict[str, Any]:
             temperature=0,
         )
 
-        content = resp.choices[0].message.content.strip()
+        content = (resp.choices[0].message.content or "").strip()
 
         # Try to parse JSON even if model wrapped it
         json_match = re.search(r"\{.*\}", content, re.S)
@@ -305,9 +265,7 @@ def openai_extract(text: str) -> Dict[str, Any]:
             content = json_match.group(0)
 
         data = json.loads(content)
-        if not isinstance(data, dict):
-            return {}
-        return data
+        return data if isinstance(data, dict) else {}
 
     except Exception:
         return {}
@@ -319,7 +277,7 @@ def clean_str(x: Any) -> str:
     return str(x).strip()
 
 
-def normalize_currency(x: str) -> str:
+def normalize_currency(x: Any) -> str:
     s = clean_str(x).upper()
     if re.fullmatch(r"[A-Z]{3}", s):
         return s
@@ -358,15 +316,51 @@ def normalize_date(x: Any) -> str:
     return ""
 
 
+def review_policy(extracted: Dict[str, Any], pdf_text: str) -> Tuple[str, str]:
+    """
+    Returns (status, reason)
+    status: processed | needs_review
+    reason: semicolon-separated reasons (only when needs_review), otherwise "Processed successfully."
+    """
+    reasons: List[str] = []
+
+    invoice_number = clean_str(extracted.get("invoice_number"))
+    currency = normalize_currency(extracted.get("currency"))
+    total = normalize_amount(extracted.get("total"))
+
+    if not invoice_number:
+        reasons.append("invoice_number missing")
+
+    if not currency:
+        reasons.append("currency missing")
+    else:
+        if not has_currency_evidence(pdf_text):
+            reasons.append("currency uncertain (no currency symbol/code detected in PDF text)")
+
+    if total:
+        if not has_total_label(pdf_text):
+            reasons.append("total not explicitly labeled (no Total/Amount Due/Balance Due/Grand Total in PDF text; may be inferred)")
+    else:
+        reasons.append("total missing")
+
+    if is_low_text_pdf(pdf_text):
+        reasons.append("scanned/low-text PDF (weak text extraction; OCR/manual review needed)")
+
+    if reasons:
+        return "needs_review", "; ".join(reasons)
+
+    return "processed", "Processed successfully."
+
+
 # -----------------------------
-# Sheet write + search helpers
+# Sheet helpers
 # -----------------------------
 def find_row_by_file_hash(ws, file_hash: str) -> Optional[int]:
     """
     Returns sheet row number (1-based). Data starts at row 2.
     """
-    idx = HEADERS.index("file_hash") + 1
-    col_vals = ws.col_values(idx)
+    idx = HEADERS.index("file_hash") + 1  # 1-based
+    col_vals = ws.col_values(idx)  # includes header at row 1
     target = (file_hash or "").strip()
     for i in range(2, len(col_vals) + 1):
         if (col_vals[i - 1] or "").strip() == target:
@@ -387,6 +381,7 @@ def append_invoice_row(ws, row_dict: Dict[str, Any]) -> int:
     if rn:
         return rn
 
+    # fallback (rare)
     return len(ws.get_all_values())
 
 
@@ -413,7 +408,8 @@ def status():
 
 @app.post("/upload")
 def upload(file: UploadFile = File(...), _auth: None = Depends(require_api_key)):
-    processed_at = datetime.utcnow().isoformat() + "+00:00"
+    # Melbourne time (with timezone offset)
+    processed_at = datetime.now(TZ).isoformat(timespec="seconds")
 
     try:
         pdf_bytes = file.file.read()
@@ -451,7 +447,7 @@ def upload(file: UploadFile = File(...), _auth: None = Depends(require_api_key))
                 "doc_type": "invoice",
             }
 
-        # Dedupe by file_hash (perfect)
+        # Dedupe by file_hash
         existing = find_row_by_file_hash(ws, file_hash)
         if existing:
             return {
@@ -464,7 +460,7 @@ def upload(file: UploadFile = File(...), _auth: None = Depends(require_api_key))
                 "doc_type": "invoice",
             }
 
-        # Extract fields (keep smart, but we decide needs_review via stricter policy)
+        # Extract fields (smart), but status decided by stricter policy
         extracted: Dict[str, Any] = {}
         if len(text) >= MIN_TEXT_CHARS:
             extracted = openai_extract(text)
@@ -484,35 +480,28 @@ def upload(file: UploadFile = File(...), _auth: None = Depends(require_api_key))
         # Dedupe key (secondary, informational)
         dedupe_key = f"{vendor_name.lower()}|{invoice_number.lower()}|{total}".strip()
 
-        # NEW: apply stricter review policy (based on uncertainty, not just totals existing)
-        # NOTE: policy uses extracted raw fields + PDF text evidence
+        # Apply review policy (based on your desired rules)
         policy_status, policy_reason = review_policy(
             {"invoice_number": invoice_number, "currency": currency, "total": total},
             text,
         )
 
-        # Optional extra sanity checks (won't flip processed->needs_review unless you want)
-        # If you WANT these to force review, uncomment the blocks below.
+        # Optional extra notes (won't flip processed -> needs_review; just notes)
         extra_notes: List[str] = []
         if not vendor_name:
             extra_notes.append("vendor_name missing")
         if not invoice_date:
             extra_notes.append("invoice_date missing")
 
-        # Build final reason string
-        # - If needs_review: include policy reasons (+ extra notes if any)
-        # - If processed: keep it clean (optionally add extra notes)
         if policy_status == "needs_review":
-            reason_parts = [policy_reason] if policy_reason else []
+            parts = [policy_reason] if policy_reason else []
             if extra_notes:
-                reason_parts.append("extra: " + ", ".join(extra_notes))
-            reason = "; ".join([p for p in reason_parts if p]).strip()
+                parts.append("extra: " + ", ".join(extra_notes))
+            reason = "; ".join([p for p in parts if p]).strip()
         else:
-            # processed
+            reason = "Processed successfully."
             if extra_notes:
-                reason = "Processed successfully; note: " + ", ".join(extra_notes)
-            else:
-                reason = "Processed successfully."
+                reason = reason + " Note: " + ", ".join(extra_notes)
 
         row = {
             "vendor_name": vendor_name,
