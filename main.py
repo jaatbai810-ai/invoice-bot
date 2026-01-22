@@ -1,499 +1,578 @@
 # main.py
 import os
 import io
-import json
 import re
+import json
 import hashlib
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple, Optional
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple
 
 import pdfplumber
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
+import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 
-from openai import OpenAI
+# -----------------------------
+# Config
+# -----------------------------
+APP_VERSION = "v3-rownumber+updatepdfurl+apikey+reviewpolicy-v4"
+SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
-APP_VERSION = "filehash-dedupe-needsreview-v3-rownumber"
+# Accept either name (you used GOOGLE_WORKSHEET_NAME)
+SHEET_NAME = (os.getenv("GOOGLE_WORKSHEET_NAME") or os.getenv("SHEET_NAME") or "invoices").strip()
 
-# ----------------------------
-# STRICT TEMPLATE DETECTION
-# ----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-TEMPLATE_STRICT_KEYWORDS = [
-    "invoice template",
-    "sample invoice",
-    "example invoice",
-    "this is a sample",
-    "lorem ipsum",
-    "placeholder",
-    "type here",
-    "enter your",
-    "enter the",
-    "insert your",
-    "your company name",
-    "your business name",
-    "your address",
-    "your logo",
+API_KEY = os.getenv("API_KEY", "").strip()
+
+# Your fixed header order (Row 1 must match)
+HEADERS = [
+    "vendor_name",
+    "invoice_number",
+    "invoice_date",
+    "due_date",
+    "currency",
+    "subtotal",
+    "tax",
+    "total",
+    "file_hash",
+    "dedupe_key",
+    "status",
+    "pdf_url",
+    "doc_type",
+    "reason",
+    "processed_at",
 ]
 
-TEMPLATE_STRICT_PATTERNS = [
-    r"\blorem\s+ipsum\b",
-    r"\binvoice\s+template\b",
-    r"\b(sample|example)\s+invoice\b",
+# Minimum text to even try OpenAI extraction
+MIN_TEXT_CHARS = 60
+
+# Stricter "low-text/scanned" detection for review policy
+# (separate from MIN_TEXT_CHARS to avoid false positives)
+LOW_TEXT_REVIEW_COMPACT_CHARS = 250
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI()
+
+
+# -----------------------------
+# Security (API key)
+# -----------------------------
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if not API_KEY:
+        # Fail closed for safety
+        raise HTTPException(status_code=500, detail="Server misconfigured: missing API_KEY env var")
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# -----------------------------
+# Google auth helpers
+# -----------------------------
+def load_service_account_info() -> Dict[str, Any]:
+    """
+    Supports:
+      - GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON string)
+      - GOOGLE_SERVICE_ACCOUNT_FILE (path)
+      - GOOGLE_APPLICATION_CREDENTIALS (path)  <-- most common on Render
+      - SECRET_ACCOUNT_FILE (path)             <-- some older setups
+    """
+    json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if json_str:
+        return json.loads(json_str)
+
+    file_path = (
+        os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or os.getenv("SECRET_ACCOUNT_FILE")
+        or ""
+    ).strip()
+
+    if file_path:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    raise RuntimeError(
+        "Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE / GOOGLE_APPLICATION_CREDENTIALS / SECRET_ACCOUNT_FILE"
+    )
+
+
+def get_gspread_client() -> gspread.Client:
+    info = load_service_account_info()
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def get_worksheet():
+    if not SHEET_ID:
+        raise RuntimeError("Missing SHEET_ID env var")
+    gc = get_gspread_client()
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.worksheet(SHEET_NAME)
+
+
+def ensure_headers_ok(ws) -> Optional[str]:
+    row1 = ws.row_values(1)
+    if not row1:
+        return "Row 1 headers are empty. Add headers exactly and freeze row 1."
+    if row1 != HEADERS:
+        return "Sheet headers mismatch. Row 1 must match exactly:\n" + ",".join(HEADERS)
+    return None
+
+
+# -----------------------------
+# PDF helpers
+# -----------------------------
+def sha256_short(data: bytes, n: int = 16) -> str:
+    return hashlib.sha256(data).hexdigest()[:n]
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    text_chunks = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                text_chunks.append(t)
+    return "\n".join(text_chunks).strip()
+
+
+def is_low_text_pdf(pdf_text: str, min_compact_chars: int = LOW_TEXT_REVIEW_COMPACT_CHARS) -> bool:
+    """
+    More robust "scanned/low-text" check:
+    - strips whitespace so random newlines don't inflate char count
+    """
+    t = (pdf_text or "").strip()
+    compact = re.sub(r"\s+", "", t)
+    return len(compact) < min_compact_chars
+
+
+# -----------------------------
+# Template detection (ULTRA strict)
+# Only skip if explicit template placeholders/words exist
+# -----------------------------
+TEMPLATE_PATTERNS = [
+    r"\binvoice template\b",
+    r"\btemplate invoice\b",
+    r"\blorem ipsum\b",
     r"\bplaceholder\b",
-    r"\btype\s+here\b",
-    r"\benter\s+(your|the)\s+(date|amount|invoice\s+number|invoice\s+no\.?|total|subtotal|tax|gst|vat|address|name)\b",
-    r"\binsert\s+(your|the)\s+(logo|name|address)\b",
-    r"\byour\s+(company|business)\s+name\b",
-    r"\byour\s+address\b",
-    r"\[.*?(enter|type|placeholder|your).{0,60}.*?\]",  # [Enter Amount]
-    r"\{.*?(enter|type|placeholder|your).{0,60}.*?\}",  # {Enter Date}
+    r"\btype here\b",
+    r"\benter (date|amount|invoice|invoice number|total|subtotal)\b",
+    r"\bfill (in|out)\b",
+    r"\bsample invoice\b",
+    r"\bdemo invoice\b",
+    r"\bexample invoice\b",
+    r"\b[s]tart typing\b",
+    r"\bdelete this\b",
+    r"\breplace with\b",
+    r"\bcompany name here\b",
+    r"\baddress here\b",
+    r"\bphone here\b",
+    r"\bemail here\b",
+    # bracket placeholders like [enter ...] or <enter ...>
+    r"\[[^\]]{0,40}(enter|placeholder|type)[^\]]{0,40}\]",
+    r"\<[^\>]{0,40}(enter|placeholder|type)[^\>]{0,40}\>",
 ]
 
-def is_explicit_template_strict(raw_text: str) -> bool:
-    """
-    ONLY skip if explicit template/placeholder signals exist.
-    Never skip due to missing fields or messy formatting.
-    """
-    if not raw_text:
-        return False  # scanned/empty -> needs_review, NOT skipped
 
-    t = raw_text.lower()
-
-    for kw in TEMPLATE_STRICT_KEYWORDS:
-        if kw in t:
+def looks_like_template(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    for pat in TEMPLATE_PATTERNS:
+        if re.search(pat, low):
             return True
-
-    for pat in TEMPLATE_STRICT_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE | re.DOTALL):
-            return True
-
     return False
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
+# -----------------------------
+# Review policy (NEW)
+# Mark needs_review if ANY:
+# - invoice_number missing
+# - currency missing (or currency uncertain)
+# - total not explicitly labeled in PDF text ("Total/Amount Due/Balance Due/Grand Total")
+# - scanned/low-text PDF
+# -----------------------------
+TOTAL_LABEL_RE = re.compile(r"\b(total|amount\s+due|balance\s+due|grand\s+total|invoice\s+total)\b", re.IGNORECASE)
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# Currency evidence in raw text (symbols or common 3-letter codes)
+CURRENCY_EVIDENCE_RE = re.compile(
+    r"\b(AUD|USD|NZD|CAD|EUR|GBP|INR|SGD|HKD)\b|(?:^|\s)[$€£]\s?\d",
+    re.IGNORECASE,
+)
 
-def short_sha256(data: bytes, n: int = 16) -> str:
-    return hashlib.sha256(data).hexdigest()[:n]
 
-def safe_str(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
+def has_total_label(pdf_text: str) -> bool:
+    return bool(TOTAL_LABEL_RE.search(pdf_text or ""))
 
-def build_dedupe_key(vendor: str, invoice_number: str, total: str) -> str:
-    return f"{safe_str(vendor).lower()}|{safe_str(invoice_number).lower()}|{safe_str(total).lower()}"
 
-def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 5) -> str:
+def has_currency_evidence(pdf_text: str) -> bool:
+    return bool(CURRENCY_EVIDENCE_RE.search(pdf_text or ""))
+
+
+def review_policy(extracted: Dict[str, Any], pdf_text: str) -> Tuple[str, str]:
     """
-    Extract text from first N pages. Scanned PDFs usually return empty/short text.
+    Returns (status, reason)
+    status: processed | needs_review
+    reason: semicolon-separated reasons (only when needs_review), otherwise "Processed successfully."
     """
+    reasons: List[str] = []
+
+    invoice_number = clean_str(extracted.get("invoice_number"))
+    currency = normalize_currency(extracted.get("currency"))
+    total = normalize_amount(extracted.get("total"))
+
+    # Rule 1: invoice_number missing
+    if not invoice_number:
+        reasons.append("invoice_number missing")
+
+    # Rule 2: currency missing (strict) + optional "uncertain" check
+    if not currency:
+        reasons.append("currency missing")
+    else:
+        # If model gave currency but there's no evidence in PDF text, flag uncertainty
+        if not has_currency_evidence(pdf_text):
+            reasons.append("currency uncertain (no currency symbol/code detected in PDF text)")
+
+    # Rule 3: total must be explicitly labeled in PDF text
+    if total:
+        if not has_total_label(pdf_text):
+            reasons.append("total not explicitly labeled (no Total/Amount Due/Balance Due/Grand Total in PDF text; may be inferred)")
+    else:
+        # If total missing, also needs review (practically required)
+        reasons.append("total missing")
+
+    # Rule 4: scanned/low-text PDF
+    if is_low_text_pdf(pdf_text):
+        reasons.append("scanned/low-text PDF (weak text extraction; OCR/manual review needed)")
+
+    if reasons:
+        return "needs_review", "; ".join(reasons)
+
+    return "processed", "Processed successfully."
+
+
+# -----------------------------
+# OpenAI extraction
+# -----------------------------
+def openai_extract(text: str) -> Dict[str, Any]:
+    """
+    Returns dict with keys:
+      vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, doc_type
+    """
+    if not OPENAI_API_KEY:
+        # If key missing, return empty so it becomes needs_review
+        return {}
+
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            parts = []
-            for page in pdf.pages[:max_pages]:
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    parts.append(txt)
-            return "\n".join(parts).strip()
-    except Exception:
-        return ""
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
+        system = (
+            "You extract invoice fields from text. "
+            "Return ONLY valid JSON with these keys:\n"
+            "vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, doc_type.\n"
+            "Dates must be YYYY-MM-DD if possible. Use empty string if unknown.\n"
+            "IMPORTANT: Do not guess. If a field is not explicitly present, return empty string."
+        )
 
-# ----------------------------
-# OPENAI EXTRACTION
-# ----------------------------
+        user = f"Invoice text:\n{text}\n\nReturn JSON only."
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-EXTRACTION_SCHEMA = {
-    "vendor_name": "",
-    "invoice_number": "",
-    "invoice_date": "",
-    "due_date": "",
-    "currency": "",
-    "subtotal": "",
-    "tax": "",
-    "total": "",
-    "doc_type": "invoice",
-}
-
-def extract_invoice_fields_with_openai(client: OpenAI, raw_text: str) -> Dict[str, Any]:
-    """
-    Uses PDF text layer only. If text is empty, returns blanks (needs_review).
-    """
-    sys = (
-        "Extract invoice fields from text. Return ONLY valid JSON with keys:\n"
-        "vendor_name, invoice_number, invoice_date, due_date, currency, subtotal, tax, total, doc_type\n"
-        "Rules:\n"
-        "- Dates -> YYYY-MM-DD when possible.\n"
-        "- If unknown -> empty string.\n"
-        "- doc_type -> 'invoice' unless clearly 'credit_note' or 'statement'.\n"
-        "- No extra keys."
-    )
-    user = f"Invoice text:\n\n{raw_text[:20000]}"
-
-    try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": sys},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             temperature=0,
         )
+
         content = resp.choices[0].message.content.strip()
+
+        # Try to parse JSON even if model wrapped it
+        json_match = re.search(r"\{.*\}", content, re.S)
+        if json_match:
+            content = json_match.group(0)
+
         data = json.loads(content)
+        if not isinstance(data, dict):
+            return {}
+        return data
 
-        out = dict(EXTRACTION_SCHEMA)
-        for k in out.keys():
-            if k in data:
-                out[k] = safe_str(data.get(k))
-        return out
     except Exception:
-        return dict(EXTRACTION_SCHEMA)
-
-def missing_fields(extracted: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    core = ["vendor_name", "invoice_date", "total"]
-    optional = ["invoice_number", "currency", "due_date", "subtotal", "tax"]
-
-    missing_core = [k for k in core if not safe_str(extracted.get(k))]
-    missing_optional = [k for k in optional if not safe_str(extracted.get(k))]
-    return missing_core, missing_optional
+        return {}
 
 
-# ----------------------------
-# GOOGLE SHEETS
-# ----------------------------
+def clean_str(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
 
-# Use YOUR env vars. Supports your current names + my old names.
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
-# You have GOOGLE_WORKSHEET_NAME; we also support SHEET_NAME
-SHEET_NAME = (os.getenv("SHEET_NAME") or os.getenv("GOOGLE_WORKSHEET_NAME") or "Sheet1").strip()
-
-REQUIRED_HEADERS = [
-    "vendor_name","invoice_number","invoice_date","due_date","currency","subtotal","tax","total",
-    "file_hash","dedupe_key","status","pdf_url","doc_type","reason","processed_at"
-]
-
-def get_google_creds() -> Credentials:
-    """
-    Supported ways to provide credentials:
-
-    1) GOOGLE_SERVICE_ACCOUNT_JSON (full JSON string)  [optional]
-    2) GOOGLE_SERVICE_ACCOUNT_FILE (path to json)      [recommended with Render secret file]
-    3) GOOGLE_APPLICATION_CREDENTIALS (path to json)   [common Google style]
-
-    For Render Secret Files:
-      filename: service_account.json
-      path: /etc/secrets/service_account.json
-    """
-    js = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-
-    # prefer explicit file envs
-    jf = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
-    if not jf:
-        # fall back to standard google env var
-        jf = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-
-    # If you stored secret file and forgot to set path env var, try default
-    if not jf and os.path.exists("/etc/secrets/service_account.json"):
-        jf = "/etc/secrets/service_account.json"
-
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-
-    if js:
-        info = json.loads(js)
-        return Credentials.from_service_account_info(info, scopes=scopes)
-
-    if jf:
-        return Credentials.from_service_account_file(jf, scopes=scopes)
-
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE (or GOOGLE_APPLICATION_CREDENTIALS)")
-
-def sheets_service():
-    creds = get_google_creds()
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-def read_headers(svc) -> List[str]:
-    rng = f"{SHEET_NAME}!1:1"
-    res = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
-    values = res.get("values", [])
-    return values[0] if values else []
-
-def ensure_headers_ok(headers: List[str]) -> Optional[str]:
-    if headers != REQUIRED_HEADERS:
-        return (
-            "Sheet headers do not match required Row 1 exactly.\n"
-            f"Expected: {','.join(REQUIRED_HEADERS)}\n"
-            f"Got: {','.join(headers)}"
-        )
-    return None
-
-def col_to_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
+def normalize_currency(x: str) -> str:
+    s = clean_str(x).upper()
+    if re.fullmatch(r"[A-Z]{3}", s):
+        return s
+    if s in ["$", "AUD$"]:
+        return "AUD"
     return s
 
-def find_existing_by_file_hash(svc, headers: List[str], file_hash: str) -> bool:
+
+def normalize_amount(x: Any) -> str:
+    s = clean_str(x)
+    if not s:
+        return ""
+    s = re.sub(r"[^\d\.\-]", "", s)
+    if not re.search(r"\d", s):
+        return ""
+    return s
+
+
+def normalize_date(x: Any) -> str:
+    s = clean_str(x)
+    if not s:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return datetime(y, mo, d).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+    return ""
+
+
+# -----------------------------
+# Sheet write + search helpers
+# -----------------------------
+def find_row_by_file_hash(ws, file_hash: str) -> Optional[int]:
     """
-    Dedupe by file_hash column scan.
+    Returns sheet row number (1-based). Data starts at row 2.
     """
-    idx = headers.index("file_hash")  # 0-based
-    letter = col_to_letter(idx + 1)
-    rng = f"{SHEET_NAME}!{letter}:{letter}"
-    res = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
-    col_vals = [row[0] for row in res.get("values", [])[1:] if row]  # skip header row
-    return file_hash in col_vals
+    idx = HEADERS.index("file_hash") + 1
+    col_vals = ws.col_values(idx)
+    target = (file_hash or "").strip()
+    for i in range(2, len(col_vals) + 1):
+        if (col_vals[i - 1] or "").strip() == target:
+            return i
+    return None
 
-def append_row(svc, headers: List[str], row_dict: Dict[str, Any]) -> None:
-    values = [safe_str(row_dict.get(h)) for h in headers]
-    body = {"values": [values]}
-    svc.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_NAME}!A:A",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body,
-    ).execute()
 
-def get_last_row_number(svc) -> int:
+def append_invoice_row(ws, row_dict: Dict[str, Any]) -> int:
     """
-    Returns last used row number (including header row).
+    Appends a row and returns row_number.
     """
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_NAME}!A:A"
-    ).execute()
-    return len(res.get("values", []))
+    values = [clean_str(row_dict.get(h, "")) for h in HEADERS]
+    ws.append_row(values, value_input_option="USER_ENTERED")
+
+    # Return last row number reliably by searching hash
+    fh = clean_str(row_dict.get("file_hash", ""))
+    rn = find_row_by_file_hash(ws, fh)
+    if rn:
+        return rn
+
+    return len(ws.get_all_values())
 
 
-# ----------------------------
-# FASTAPI
-# ----------------------------
+def update_cell_by_header(ws, row_number: int, header: str, value: str):
+    col = HEADERS.index(header) + 1
+    ws.update_cell(row_number, col, value)
 
-app = FastAPI()
 
-@app.get("/status")
-def status():
-    return {"status": "ok", "message": "server running", "version": APP_VERSION}
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": APP_VERSION}
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    processed_at = now_iso()
-
-    filename = file.filename or "uploaded.pdf"
-    content_type = (file.content_type or "").lower()
-
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Empty file received. Zapier must send real file blob in multipart/form-data key 'file'."},
-        )
-
-    file_hash = short_sha256(pdf_bytes, n=16)
-
-    raw_text = extract_pdf_text(pdf_bytes)
-
-    # STRICT template skip
-    if is_explicit_template_strict(raw_text):
-        return {
-            "sheet_status": "skipped_template",
-            "status": "skipped_template",
-            "reason": "Explicit template/placeholder text detected (strict rule).",
-            "file_hash": file_hash,
-            "dedupe_key": "",
-            "processed_at": processed_at,
-            "doc_type": "invoice",
-            "filename": filename,
-            "content_type": content_type,
-        }
-
-    # Extract with OpenAI
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if api_key:
-        client = OpenAI(api_key=api_key)
-        extracted = extract_invoice_fields_with_openai(client, raw_text)
-    else:
-        extracted = dict(EXTRACTION_SCHEMA)
-
-    missing_core, missing_optional = missing_fields(extracted)
-
-    if not raw_text or len(raw_text.strip()) < 30:
-        status_val = "needs_review"
-        reason = "No/low text detected in PDF (likely scanned). Needs OCR/manual review."
-    elif missing_core:
-        status_val = "needs_review"
-        reason = f"Missing key fields: {', '.join(missing_core)}. Missing optional: {', '.join(missing_optional)}."
-    else:
-        status_val = "processed"
-        reason = "Processed successfully."
-
-    dedupe_key = build_dedupe_key(
-        extracted.get("vendor_name", ""),
-        extracted.get("invoice_number", ""),
-        extracted.get("total", ""),
-    )
-
-    if not SHEET_ID:
-        return {
-            "sheet_status": "needs_review",
-            "status": "needs_review",
-            "reason": "Missing SHEET_ID env var on server.",
-            "file_hash": file_hash,
-            "dedupe_key": dedupe_key,
-            "processed_at": processed_at,
-            "doc_type": extracted.get("doc_type", "invoice"),
-            "extracted": extracted,
-        }
-
-    try:
-        svc = sheets_service()
-
-        headers = read_headers(svc)
-        hdr_err = ensure_headers_ok(headers)
-        if hdr_err:
-            return {
-                "sheet_status": "needs_review",
-                "status": "needs_review",
-                "reason": hdr_err,
-                "file_hash": file_hash,
-                "dedupe_key": dedupe_key,
-                "processed_at": processed_at,
-                "doc_type": extracted.get("doc_type", "invoice"),
-                "extracted": extracted,
-            }
-
-        # Primary dedupe by file_hash
-        if find_existing_by_file_hash(svc, headers, file_hash):
-            return {
-                "sheet_status": "skipped_duplicate",
-                "status": "skipped_duplicate",
-                "reason": "Duplicate detected by file_hash (same PDF already processed).",
-                "file_hash": file_hash,
-                "dedupe_key": dedupe_key,
-                "processed_at": processed_at,
-                "doc_type": extracted.get("doc_type", "invoice"),
-            }
-
-        # Append row ALWAYS for messy/scanned (not template)
-        row = {
-            "vendor_name": extracted.get("vendor_name", ""),
-            "invoice_number": extracted.get("invoice_number", ""),
-            "invoice_date": extracted.get("invoice_date", ""),
-            "due_date": extracted.get("due_date", ""),
-            "currency": extracted.get("currency", ""),
-            "subtotal": extracted.get("subtotal", ""),
-            "tax": extracted.get("tax", ""),
-            "total": extracted.get("total", ""),
-            "file_hash": file_hash,
-            "dedupe_key": dedupe_key,
-            "status": status_val,
-            "pdf_url": "",  # Zapier fills this after Drive upload
-            "doc_type": extracted.get("doc_type", "invoice"),
-            "reason": reason,
-            "processed_at": processed_at,
-        }
-
-        append_row(svc, headers, row)
-
-        # GUARANTEED FIX: return row_number so Zapier can update without Lookup
-        row_number = get_last_row_number(svc)
-
-        return {
-            "sheet_status": "row_appended",
-            "status": status_val,
-            "reason": reason,
-            "file_hash": file_hash,
-            "dedupe_key": dedupe_key,
-            "processed_at": processed_at,
-            "doc_type": extracted.get("doc_type", "invoice"),
-            "row_number": row_number,
-        }
-
-    except Exception as e:
-        return {
-            "sheet_status": "needs_review",
-            "status": "needs_review",
-            "reason": f"Server error while writing to Google Sheets: {type(e).__name__}: {str(e)}",
-            "file_hash": file_hash,
-            "dedupe_key": dedupe_key,
-            "processed_at": processed_at,
-            "doc_type": extracted.get("doc_type", "invoice"),
-        }
-from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-
+# -----------------------------
+# API models
+# -----------------------------
 class PdfUrlUpdate(BaseModel):
     file_hash: str
     pdf_url: str
 
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/status")
+def status():
+    return {"status": "ok", "message": "server running", "version": APP_VERSION}
+
+
+@app.post("/upload")
+def upload(file: UploadFile = File(...), _auth: None = Depends(require_api_key)):
+    processed_at = datetime.utcnow().isoformat() + "+00:00"
+
+    try:
+        pdf_bytes = file.file.read()
+        if not pdf_bytes:
+            return JSONResponse(status_code=400, content={"detail": "Empty file"})
+
+        file_hash = sha256_short(pdf_bytes, 16)
+
+        # Extract text
+        text = extract_pdf_text(pdf_bytes)
+
+        # Strict template skip
+        if looks_like_template(text):
+            return {
+                "sheet_status": "skipped_template",
+                "status": "skipped_template",
+                "reason": "Looks like a template invoice (explicit template/placeholder words detected).",
+                "file_hash": file_hash,
+                "dedupe_key": "",
+                "processed_at": processed_at,
+                "doc_type": "invoice",
+            }
+
+        # Open sheet
+        ws = get_worksheet()
+        hdr_err = ensure_headers_ok(ws)
+        if hdr_err:
+            return {
+                "sheet_status": "needs_review",
+                "status": "needs_review",
+                "reason": f"Server error: {hdr_err}",
+                "file_hash": file_hash,
+                "dedupe_key": "",
+                "processed_at": processed_at,
+                "doc_type": "invoice",
+            }
+
+        # Dedupe by file_hash (perfect)
+        existing = find_row_by_file_hash(ws, file_hash)
+        if existing:
+            return {
+                "sheet_status": "skipped_duplicate",
+                "status": "skipped_duplicate",
+                "reason": "Duplicate PDF (file_hash already exists).",
+                "file_hash": file_hash,
+                "dedupe_key": "",
+                "processed_at": processed_at,
+                "doc_type": "invoice",
+            }
+
+        # Extract fields (keep smart, but we decide needs_review via stricter policy)
+        extracted: Dict[str, Any] = {}
+        if len(text) >= MIN_TEXT_CHARS:
+            extracted = openai_extract(text)
+        else:
+            extracted = {}
+
+        vendor_name = clean_str(extracted.get("vendor_name"))
+        invoice_number = clean_str(extracted.get("invoice_number"))
+        invoice_date = normalize_date(extracted.get("invoice_date"))
+        due_date = normalize_date(extracted.get("due_date"))
+        currency = normalize_currency(extracted.get("currency"))
+        subtotal = normalize_amount(extracted.get("subtotal"))
+        tax = normalize_amount(extracted.get("tax"))
+        total = normalize_amount(extracted.get("total"))
+        doc_type = clean_str(extracted.get("doc_type")) or "invoice"
+
+        # Dedupe key (secondary, informational)
+        dedupe_key = f"{vendor_name.lower()}|{invoice_number.lower()}|{total}".strip()
+
+        # NEW: apply stricter review policy (based on uncertainty, not just totals existing)
+        # NOTE: policy uses extracted raw fields + PDF text evidence
+        policy_status, policy_reason = review_policy(
+            {"invoice_number": invoice_number, "currency": currency, "total": total},
+            text,
+        )
+
+        # Optional extra sanity checks (won't flip processed->needs_review unless you want)
+        # If you WANT these to force review, uncomment the blocks below.
+        extra_notes: List[str] = []
+        if not vendor_name:
+            extra_notes.append("vendor_name missing")
+        if not invoice_date:
+            extra_notes.append("invoice_date missing")
+
+        # Build final reason string
+        # - If needs_review: include policy reasons (+ extra notes if any)
+        # - If processed: keep it clean (optionally add extra notes)
+        if policy_status == "needs_review":
+            reason_parts = [policy_reason] if policy_reason else []
+            if extra_notes:
+                reason_parts.append("extra: " + ", ".join(extra_notes))
+            reason = "; ".join([p for p in reason_parts if p]).strip()
+        else:
+            # processed
+            if extra_notes:
+                reason = "Processed successfully; note: " + ", ".join(extra_notes)
+            else:
+                reason = "Processed successfully."
+
+        row = {
+            "vendor_name": vendor_name,
+            "invoice_number": invoice_number,
+            "invoice_date": invoice_date,
+            "due_date": due_date,
+            "currency": currency,
+            "subtotal": subtotal,
+            "tax": tax,
+            "total": total,
+            "file_hash": file_hash,
+            "dedupe_key": dedupe_key,
+            "status": policy_status,
+            "pdf_url": "",  # filled later by /update_pdf_url
+            "doc_type": doc_type,
+            "reason": reason,
+            "processed_at": processed_at,
+        }
+
+        row_number = append_invoice_row(ws, row)
+
+        return {
+            "sheet_status": "row_appended",
+            "status": policy_status,
+            "reason": reason,
+            "file_hash": file_hash,
+            "dedupe_key": dedupe_key,
+            "processed_at": processed_at,
+            "doc_type": doc_type,
+            "row_number": row_number,
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Server error: {type(e).__name__}: {str(e)}"},
+        )
+
+
 @app.post("/update_pdf_url")
-def update_pdf_url(payload: PdfUrlUpdate):
+def update_pdf_url(payload: PdfUrlUpdate, _auth: None = Depends(require_api_key)):
     file_hash = (payload.file_hash or "").strip()
     pdf_url = (payload.pdf_url or "").strip()
 
     if not file_hash or not pdf_url:
         return JSONResponse(status_code=400, content={"detail": "file_hash and pdf_url are required"})
 
-    if not SHEET_ID:
-        return JSONResponse(status_code=500, content={"detail": "Missing SHEET_ID env var"})
-
     try:
-        svc = sheets_service()
-        headers = read_headers(svc)
-        hdr_err = ensure_headers_ok(headers)
+        ws = get_worksheet()
+        hdr_err = ensure_headers_ok(ws)
         if hdr_err:
             return JSONResponse(status_code=500, content={"detail": hdr_err})
 
-        # Find row by file_hash
-        file_hash_idx = headers.index("file_hash")
-        file_hash_col = col_to_letter(file_hash_idx + 1)
-        rng = f"{SHEET_NAME}!{file_hash_col}:{file_hash_col}"
-
-        res = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=rng).execute()
-        values = res.get("values", [])
-        found_row_number = None
-
-        for i in range(1, len(values)):  # skip header
-            cell = (values[i][0] if values[i] else "").strip()
-            if cell == file_hash:
-                found_row_number = i + 1  # sheet row number
-                break
-
-        if not found_row_number:
+        row_number = find_row_by_file_hash(ws, file_hash)
+        if not row_number:
             return JSONResponse(status_code=404, content={"detail": f"Row not found for file_hash={file_hash}"})
 
-        # Update pdf_url cell
-        pdf_url_idx = headers.index("pdf_url")
-        pdf_url_col = col_to_letter(pdf_url_idx + 1)
-        update_range = f"{SHEET_NAME}!{pdf_url_col}{found_row_number}"
+        update_cell_by_header(ws, row_number, "pdf_url", pdf_url)
 
-        svc.spreadsheets().values().update(
-            spreadsheetId=SHEET_ID,
-            range=update_range,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[pdf_url]]},
-        ).execute()
-
-        return {"status": "ok", "file_hash": file_hash, "row_number": found_row_number, "pdf_url": pdf_url}
+        return {"status": "ok", "file_hash": file_hash, "row_number": row_number, "pdf_url": pdf_url}
 
     except Exception as e:
         return JSONResponse(
